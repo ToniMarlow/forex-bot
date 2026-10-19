@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""
+Telegram-бот по форексу: работает сам, 24/7 (нужен сервер, см. инструкцию).
+
+Что умеет:
+  - любой человек пишет боту /start и сразу зарегистрирован;
+  - кнопки: выбрать пару и мгновенно получить данные по ней (цена, правила,
+    уровни SL/TP, новости);
+  - у каждого свой набор пар для ежедневной рассылки (кнопка «Мои пары»);
+  - ежедневный разбор в заданное время (по умолчанию 02:00 UTC = 07:00 Ташкент);
+  - журнал сигналов: бот сам проверяет, чем закончились прошлые сигналы,
+    и раз в неделю (понедельник) присылает итоги.
+
+Правила сигналов (отобраны бэктестом на 5 годах дневок, см. backtest2.py):
+  1) цена пересекла EMA50 (SL 2 ATR / TP 4 ATR)
+  2) пересечение MACD      (SL 1.5 ATR / TP 3 ATR)
+  3) разворот по RSI 30/70 (SL 2 ATR / TP 4 ATR)
+
+Переменные окружения:
+  TELEGRAM_BOT_TOKEN  токен бота (обязательно)
+  ALLOWED_USERS       необязательно: id через запятую, если бот должен быть закрытым
+  DAILY_HOUR_UTC      час ежедневной рассылки по UTC (по умолчанию 2)
+  DB_PATH             путь к базе (по умолчанию /data/bot.db, если есть папка /data)
+"""
+import datetime as dt
+import json
+import os
+import sqlite3
+import threading
+import time
+import traceback
+import urllib.request
+
+import numpy as np
+
+import forex_analyzer as fa
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+DB_PATH = os.environ.get("DB_PATH") or ("/data/bot.db" if os.path.isdir("/data") else "bot.db")
+ALLOWED = {int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
+DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "2"))
+
+PIP = 0.0001
+SPREAD_PIPS = {"GBP/USD": 1.2, "EUR/USD": 0.9, "GBP/AUD": 2.8, "EUR/NZD": 3.5, "EUR/CAD": 2.5}
+MAXHOLD = 20
+CACHE_SECONDS = 600
+
+RULES = {
+    "ema50": dict(title="Цена пересекла EMA50", sl=2.0, tp=4.0,
+                  bt="Бэктест 5 лет: ~53% прибыльных, около +0.2R на сделку"),
+    "macd": dict(title="Пересечение MACD", sl=1.5, tp=3.0,
+                 bt="Бэктест 5 лет: ~45% прибыльных, около +0.1R на сделку"),
+    "rsi": dict(title="Разворот по RSI (30/70)", sl=2.0, tp=4.0,
+                bt="Бэктест 5 лет: ~52% прибыльных, около +0.2R на сделку"),
+}
+ICON = {1: "🟢 BUY", -1: "🔴 SELL"}
+AGE = {0: "на последней закрытой свече", 1: "1 день назад", 2: "2 дня назад"}
+KEY = {p.replace("/", ""): p for p in fa.PAIRS}
+
+db = None
+lock = threading.Lock()
+_cache = {}
+
+
+def log(*a):
+    print(dt.datetime.now().strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ------------------------- БАЗА -------------------------
+def init_db():
+    global db
+    db = sqlite3.connect(DB_PATH, check_same_thread=False)
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users(chat_id INTEGER PRIMARY KEY, name TEXT, joined TEXT, daily INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS subs(chat_id INTEGER, pair TEXT, PRIMARY KEY(chat_id, pair));
+    CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, pair TEXT, rule TEXT, dir INTEGER,
+        bar_date TEXT, entry REAL, sl REAL, tp REAL, risk REAL, spread REAL,
+        status TEXT DEFAULT 'open', r REAL, UNIQUE(pair, rule, bar_date));
+    CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+    """)
+    db.commit()
+
+
+def q(sql, args=()):
+    with lock:
+        cur = db.execute(sql, args)
+        rows = cur.fetchall()
+        db.commit()
+        return rows
+
+
+def get_meta(k):
+    r = q("SELECT v FROM meta WHERE k=?", (k,))
+    return r[0][0] if r else None
+
+
+def set_meta(k, v):
+    q("INSERT OR REPLACE INTO meta VALUES(?,?)", (k, v))
+
+
+def ensure_user(chat_id, name):
+    if q("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)):
+        return False
+    q("INSERT INTO users(chat_id, name, joined) VALUES(?,?,?)", (chat_id, name, dt.date.today().isoformat()))
+    for p in fa.PAIRS:
+        q("INSERT OR IGNORE INTO subs VALUES(?,?)", (chat_id, p))
+    log("новый пользователь", chat_id, name)
+    return True
+
+
+# ------------------------- TELEGRAM API -------------------------
+def api(method, **params):
+    params = {k: v for k, v in params.items() if v is not None}
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}",
+                                 data=json.dumps(params).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        if "not modified" not in str(e):
+            log(f"API {method}: {e}")
+        return None
+
+
+def send(chat_id, text, kb=None):
+    return api("sendMessage", chat_id=chat_id, text=text[:4000], reply_markup=kb)
+
+
+def edit(chat_id, msg_id, text, kb=None):
+    return api("editMessageText", chat_id=chat_id, message_id=msg_id, text=text[:4000], reply_markup=kb)
+
+
+# ------------------------- АНАЛИЗ -------------------------
+def fmt(x):
+    return f"{x:.5f}"
+
+
+def load(pair):
+    full = fa.fetch(fa.PAIRS[pair], "1d", period="2y")
+    today = dt.datetime.now(dt.timezone.utc).date()
+    df = full.iloc[:-1] if full.index[-1].date() >= today else full
+    return full, df
+
+
+def analyze_pair(pair, force=False):
+    now = time.time()
+    if not force and pair in _cache and now - _cache[pair][0] < CACHE_SECONDS:
+        return _cache[pair][1]
+    full, df = load(pair)
+    c = df["Close"]
+    e50 = fa.ema(c, 50)
+    rv = fa.rsi(c).values
+    macd = fa.ema(c, 12) - fa.ema(c, 26)
+    hist = (macd - fa.ema(macd, 9)).values
+    states = {
+        "ema50": np.sign((c - e50).values),
+        "macd": np.sign(hist),
+        "rsi": np.where(rv < 30, 1, np.where(rv > 70, -1, 0)),
+    }
+    n, events = len(df), []
+    for rule, st in states.items():
+        for age in range(3):
+            i = n - 1 - age
+            if i < 1:
+                break
+            if st[i] != 0 and st[i] != st[i - 1]:
+                events.append(dict(rule=rule, dir=int(st[i]), age=age,
+                                   bar=df.index[i].strftime("%Y-%m-%d"), entry=float(c.iloc[i])))
+                break
+    base, quote = pair.split("/")
+    res = dict(pair=pair, price=float(full["Close"].iloc[-1]), atr=float(fa.atr(df).iloc[-1]),
+               bar=df.index[-1].strftime("%Y-%m-%d"), events=events, rsi=float(rv[-1]),
+               ema_side=int(states["ema50"][-1]), macd_side=int(states["macd"][-1]),
+               trend=fa.trend_dir(df), news=fa.upcoming_events({base, quote}))
+    _cache[pair] = (now, res)
+    return res
+
+
+def levels(price, atr, d, sl_a, tp_a):
+    return price - d * sl_a * atr, price + d * tp_a * atr
+
+
+def pair_text(res):
+    p, price, a = res["pair"], res["price"], res["atr"]
+    tr = {1: "вверх", -1: "вниз", 0: "смешанный"}[res["trend"]]
+    lines = [f"📊 {p}   {fmt(price)}",
+             f"Дневная свеча закрыта: {res['bar']} · ATR {fmt(a)}", "",
+             f"Тренд (EMA20/50/200): {tr}",
+             f"Цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50 · "
+             f"MACD {'выше' if res['macd_side'] > 0 else 'ниже'} сигнальной · RSI {res['rsi']:.0f}", ""]
+    if res["events"]:
+        for e in res["events"]:
+            rule = RULES[e["rule"]]
+            sl, tp = levels(price, a, e["dir"], rule["sl"], rule["tp"])
+            lines += [f"{ICON[e['dir']]}: {rule['title']} ({AGE[e['age']]})",
+                      f"   Вход ~{fmt(price)}  SL {fmt(sl)}  TP {fmt(tp)}",
+                      f"   {rule['bt']}"]
+    else:
+        lines.append("Свежих сигналов по правилам нет.")
+    bs, bt = levels(price, a, 1, 2, 4)
+    ss, st = levels(price, a, -1, 2, 4)
+    lines += ["", "Если входишь по своему анализу (SL 2 ATR, TP 4 ATR):",
+              f"   BUY:  SL {fmt(bs)}  TP {fmt(bt)}",
+              f"   SELL: SL {fmt(ss)}  TP {fmt(st)}"]
+    if res["news"]:
+        lines += ["", "⚠️ Важные новости: " + "; ".join(f"{c} {t} через {h:.0f}ч" for h, c, t in res["news"][:3])]
+    lines += ["", "Не финансовая рекомендация. Используй стоп-лосс."]
+    return "\n".join(lines)
+
+
+def one_line(res):
+    side = "выше" if res["ema_side"] > 0 else "ниже"
+    return f"⚪ {res['pair']}: сигнала нет · {fmt(res['price'])} · {side} EMA50, RSI {res['rsi']:.0f}"
+
+
+# ------------------------- ЖУРНАЛ СИГНАЛОВ -------------------------
+def evaluate_open(data):
+    rows = q("SELECT id,pair,dir,bar_date,entry,sl,tp,risk,spread FROM signals WHERE status='open'")
+    for sid, pair, d, bar, entry, sl, tp, risk, spread in rows:
+        try:
+            if pair not in data:
+                continue
+            _, df = load(pair)
+            sub = df[df.index.strftime("%Y-%m-%d") > bar]
+            res = None
+            for k, (_, row) in enumerate(sub.iterrows(), 1):
+                hi, lo = row["High"], row["Low"]
+                if (lo <= sl) if d == 1 else (hi >= sl):
+                    res = (sl - entry) * d / risk
+                elif (hi >= tp) if d == 1 else (lo <= tp):
+                    res = (tp - entry) * d / risk
+                elif k >= MAXHOLD:
+                    res = (row["Close"] - entry) * d / risk
+                if res is not None:
+                    break
+            if res is not None:
+                q("UPDATE signals SET status='closed', r=? WHERE id=?", (res - spread / risk, sid))
+        except Exception:
+            traceback.print_exc()
+
+
+def record_signals(data):
+    for pair, res in data.items():
+        for e in res["events"]:
+            if e["age"] != 0:
+                continue
+            rule = RULES[e["rule"]]
+            risk = rule["sl"] * res["atr"]
+            sl, tp = levels(e["entry"], res["atr"], e["dir"], rule["sl"], rule["tp"])
+            q("INSERT OR IGNORE INTO signals(pair,rule,dir,bar_date,entry,sl,tp,risk,spread) VALUES(?,?,?,?,?,?,?,?,?)",
+              (pair, e["rule"], e["dir"], e["bar"], e["entry"], sl, tp, risk, SPREAD_PIPS[pair] * PIP))
+
+
+def stats_text():
+    rows = q("SELECT pair,rule,dir,bar_date,status,r FROM signals ORDER BY id")
+    closed = [r for r in rows if r[4] == "closed"]
+    opened = [r for r in rows if r[4] == "open"]
+    lines = ["📊 Журнал сигналов (с запуска бота, результат после спреда)", ""]
+    if not closed:
+        lines.append("Пока нет закрытых сигналов.")
+    else:
+        rs = np.array([r[5] for r in closed])
+        lines.append(f"Закрыто: {len(rs)} · прибыльных {np.mean(rs > 0) * 100:.0f}% · "
+                     f"средний {rs.mean():+.2f}R · всего {rs.sum():+.1f}R")
+        for rule, info in RULES.items():
+            x = np.array([r[5] for r in closed if r[1] == rule])
+            if len(x):
+                lines.append(f"  • {info['title']}: {len(x)} шт., {x.mean():+.2f}R")
+        lines += ["", "Последние:"]
+        for pair, rule, d, bar, _, r in closed[-5:]:
+            lines.append(f"  {bar} {pair} {'BUY' if d == 1 else 'SELL'}: {r:+.2f}R")
+    lines.append(f"\nОткрытых сейчас: {len(opened)}")
+    lines.append("R — результат в долях риска (1R = расстояние до стоп-лосса).")
+    lines.append("Выборка маленькая: выводы делай после десятков сигналов.")
+    return "\n".join(lines)
+
+
+# ------------------------- ЕЖЕДНЕВНАЯ РАССЫЛКА -------------------------
+def run_daily():
+    log("ежедневный разбор: старт")
+    data = {}
+    for p in fa.PAIRS:
+        try:
+            data[p] = analyze_pair(p, force=True)
+        except Exception as e:
+            log(f"{p}: ошибка данных — {e}")
+    if not data:
+        return
+    evaluate_open(data)
+    record_signals(data)
+    today = dt.datetime.now(dt.timezone.utc)
+    weekly = today.weekday() == 0
+    for (chat_id,) in q("SELECT chat_id FROM users WHERE daily=1"):
+        pairs = [r[0] for r in q("SELECT pair FROM subs WHERE chat_id=?", (chat_id,)) if r[0] in data]
+        if not pairs:
+            continue
+        sig = [p for p in pairs if any(e["age"] == 0 for e in data[p]["events"])]
+        head = f"🌅 Ежедневный разбор {today.date()}"
+        parts = [head]
+        for p in sig:
+            parts.append(pair_text({**data[p], "events": [e for e in data[p]["events"] if e["age"] == 0]}))
+        quiet = [one_line(data[p]) for p in pairs if p not in sig]
+        if quiet:
+            parts.append("\n".join(quiet))
+        send(chat_id, "\n\n".join(parts), MAIN_KB)
+        if weekly:
+            send(chat_id, "📅 Итоги недели\n\n" + stats_text())
+    log("ежедневный разбор: готово")
+
+
+def scheduler():
+    while True:
+        try:
+            now = dt.datetime.now(dt.timezone.utc)
+            key = now.strftime("%Y-%m-%d")
+            if now.hour >= DAILY_HOUR_UTC and get_meta("last_daily") != key:
+                set_meta("last_daily", key)
+                if now.weekday() < 5:   # в выходные рынок закрыт
+                    run_daily()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(60)
+
+
+# ------------------------- ИНТЕРФЕЙС -------------------------
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+MAIN_KB = {"inline_keyboard": [
+    [btn("📈 Проверить пару", "menu")],
+    [btn("⭐ Мои пары и уведомления", "subs")],
+    [btn("📊 Статистика сигналов", "stats")],
+    [btn("ℹ️ Как это работает", "help")],
+]}
+
+HELP = (
+    "ℹ️ Как это работает\n\n"
+    "Бот смотрит дневные свечи по 5 парам и ищет сигналы по трём правилам, "
+    "которые прошли проверку на 5 годах истории:\n"
+    "1) цена пересекла EMA50\n2) пересечение MACD\n3) разворот по RSI (30/70)\n\n"
+    "«Проверить пару» — мгновенные данные: цена, состояние правил, уровни SL/TP "
+    "и важные новости.\n"
+    f"«Мои пары» — выбери, по каким парам получать ежедневный разбор "
+    f"({DAILY_HOUR_UTC:02d}:00 UTC, в будни).\n"
+    "«Статистика» — как закончились прошлые сигналы бота.\n\n"
+    "На истории преимущество небольшое (около +0.1–0.2R на сделку), "
+    "поэтому сначала проверяй на демо-счёте. Не финансовая рекомендация."
+)
+
+
+def pairs_kb():
+    names = list(fa.PAIRS)
+    rows = [[btn(names[i], "p:" + names[i].replace("/", "")) for i in range(j, min(j + 2, len(names)))]
+            for j in range(0, len(names), 2)]
+    rows.append([btn("⬅️ Меню", "main")])
+    return {"inline_keyboard": rows}
+
+
+def subs_kb(chat_id):
+    on = {r[0] for r in q("SELECT pair FROM subs WHERE chat_id=?", (chat_id,))}
+    daily = q("SELECT daily FROM users WHERE chat_id=?", (chat_id,))[0][0]
+    rows = [[btn(("✅ " if p in on else "☐ ") + p, "t:" + p.replace("/", ""))] for p in fa.PAIRS]
+    rows.append([btn("🔔 Ежедневный разбор: " + ("ВКЛ" if daily else "ВЫКЛ"), "d")])
+    rows.append([btn("⬅️ Меню", "main")])
+    return {"inline_keyboard": rows}
+
+
+SUBS_TEXT = ("⭐ Мои пары\n\nОтметь пары для ежедневного разбора. Проверить любую пару "
+             "можно в любой момент кнопкой «Проверить пару».")
+
+
+def handle_message(m):
+    chat_id = m["chat"]["id"]
+    name = (m.get("from") or {}).get("first_name", "")
+    if ALLOWED and chat_id not in ALLOWED:
+        send(chat_id, "Доступ к боту закрыт.")
+        return
+    new = ensure_user(chat_id, name)
+    text = (m.get("text") or "").strip()
+    if text.startswith("/start") or new:
+        send(chat_id, "👋 Привет! Я слежу за 5 валютными парами (GBP/USD, EUR/USD, GBP/AUD, "
+                      "EUR/NZD, EUR/CAD) и присылаю сигналы.\n\nТы уже подписан на ежедневный "
+                      "разбор по всем парам. Что делаем?", MAIN_KB)
+    elif text.startswith("/help"):
+        send(chat_id, HELP, MAIN_KB)
+    else:
+        send(chat_id, "Выбери действие:", MAIN_KB)
+
+
+def handle_callback(cb):
+    chat_id = cb["message"]["chat"]["id"]
+    msg_id = cb["message"]["message_id"]
+    data = cb.get("data", "")
+    api("answerCallbackQuery", callback_query_id=cb["id"])
+    if ALLOWED and chat_id not in ALLOWED:
+        return
+    ensure_user(chat_id, (cb.get("from") or {}).get("first_name", ""))
+    if data == "main":
+        edit(chat_id, msg_id, "Выбери действие:", MAIN_KB)
+    elif data == "menu":
+        edit(chat_id, msg_id, "Выбери пару:", pairs_kb())
+    elif data.startswith("p:") and data[2:] in KEY:
+        pair = KEY[data[2:]]
+        kb = {"inline_keyboard": [[btn("🔄 Обновить", data)], [btn("⬅️ К парам", "menu")]]}
+        edit(chat_id, msg_id, f"⏳ Считаю {pair}…")
+        try:
+            edit(chat_id, msg_id, pair_text(analyze_pair(pair)), kb)
+        except Exception as e:
+            log(f"{pair}: {e}")
+            edit(chat_id, msg_id, f"Не удалось получить данные по {pair}. Попробуй через минуту.", kb)
+    elif data == "subs":
+        edit(chat_id, msg_id, SUBS_TEXT, subs_kb(chat_id))
+    elif data.startswith("t:") and data[2:] in KEY:
+        pair = KEY[data[2:]]
+        if q("SELECT 1 FROM subs WHERE chat_id=? AND pair=?", (chat_id, pair)):
+            q("DELETE FROM subs WHERE chat_id=? AND pair=?", (chat_id, pair))
+        else:
+            q("INSERT INTO subs VALUES(?,?)", (chat_id, pair))
+        edit(chat_id, msg_id, SUBS_TEXT, subs_kb(chat_id))
+    elif data == "d":
+        q("UPDATE users SET daily=1-daily WHERE chat_id=?", (chat_id,))
+        edit(chat_id, msg_id, SUBS_TEXT, subs_kb(chat_id))
+    elif data == "stats":
+        edit(chat_id, msg_id, stats_text(), {"inline_keyboard": [[btn("⬅️ Меню", "main")]]})
+    elif data == "help":
+        edit(chat_id, msg_id, HELP, {"inline_keyboard": [[btn("⬅️ Меню", "main")]]})
+
+
+def handle_update(u):
+    if "message" in u:
+        handle_message(u["message"])
+    elif "callback_query" in u:
+        handle_callback(u["callback_query"])
+
+
+def main():
+    if not TOKEN:
+        raise SystemExit("Не задан TELEGRAM_BOT_TOKEN")
+    init_db()
+    log(f"бот запущен, база: {DB_PATH}")
+    threading.Thread(target=scheduler, daemon=True).start()
+    offset = None
+    while True:
+        r = api("getUpdates", timeout=30, offset=offset, allowed_updates=["message", "callback_query"])
+        if not r or not r.get("ok"):
+            time.sleep(5)
+            continue
+        for u in r["result"]:
+            offset = u["update_id"] + 1
+            try:
+                handle_update(u)
+            except Exception:
+                traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
