@@ -51,6 +51,10 @@ NEWS_QUERY = {
 WEIGHTS = {"technical": 0.35, "candles": 0.20, "patterns": 0.15,
            "fundamental": 0.15, "sentiment": 0.15}
 SIGNAL_THRESHOLD = 25  # |итог| >= 25 -> BUY/SELL, иначе WAIT
+COUNTER_TREND_THRESHOLD = 40  # сигнал против тренда нужен сильнее обычного
+CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+CALENDAR_WARN_HOURS = 24      # предупреждать о важных новостях в ближайшие N часов
+CALENDAR_BLOCK_HOURS = 3      # если новость ближе — сигнал отменяется (WAIT)
 
 POS_WORDS = ["hawkish", "rate hike", "hikes", "strong", "rises", "rallies", "surge",
              "gains", "beats", "robust", "jumps", "climbs", "higher inflation",
@@ -61,11 +65,11 @@ NEG_WORDS = ["dovish", "rate cut", "cuts rates", "weak", "falls", "slumps", "dro
 
 
 # ------------------------- ДАННЫЕ -------------------------
-def fetch(ticker, tf):
+def fetch(ticker, tf, period=None):
     if tf == "4h":
         df = yf.download(ticker, period="60d", interval="1h", progress=False, auto_adjust=True)
     else:
-        df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=True)
+        df = yf.download(ticker, period=period or "2y", interval="1d", progress=False, auto_adjust=True)
     if df is None or df.empty:
         raise ValueError("нет данных")
     if isinstance(df.columns, pd.MultiIndex):
@@ -251,6 +255,50 @@ def sentiment_score(base, quote):
     return float(np.clip(sb - sq, -100, 100)), notes, heads
 
 
+# ------------------------- ТРЕНД И КАЛЕНДАРЬ -------------------------
+def trend_dir(df):
+    c = df["Close"]
+    e20, e50, e200 = ema(c, 20), ema(c, 50), ema(c, 200)
+    if e20.iloc[-1] > e50.iloc[-1] > e200.iloc[-1]:
+        return 1
+    if e20.iloc[-1] < e50.iloc[-1] < e200.iloc[-1]:
+        return -1
+    return 0
+
+
+_calendar = None
+
+
+def load_calendar():
+    global _calendar
+    if _calendar is not None:
+        return _calendar
+    try:
+        req = urllib.request.Request(CALENDAR_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            _calendar = json.loads(r.read())
+    except Exception:
+        _calendar = []
+    return _calendar
+
+
+def upcoming_events(currencies, hours=CALENDAR_WARN_HOURS):
+    """Важные (High impact) события по валютам в ближайшие N часов."""
+    now = dt.datetime.now(dt.timezone.utc)
+    out = []
+    for e in load_calendar():
+        if e.get("impact") != "High" or e.get("country") not in currencies:
+            continue
+        try:
+            t = dt.datetime.fromisoformat(e["date"]).astimezone(dt.timezone.utc)
+        except Exception:
+            continue
+        h = (t - now).total_seconds() / 3600
+        if 0 <= h <= hours:
+            out.append((h, e["country"], e.get("title", "")))
+    return sorted(out)
+
+
 # ------------------------- ИТОГ -------------------------
 def analyze(name, ticker, tf):
     base, quote = name.split("/")
@@ -267,7 +315,55 @@ def analyze(name, ticker, tf):
     sign = 1 if total > 0 else -1
     agree = sum(1 for v in parts.values() if v * sign > 10)
     confidence = int(min(100, abs(total) * 1.6 + agree * 6))
+    flags = []
 
+    # 1) фильтр по тренду
+    trend = trend_dir(df)
+    counter = signal != "WAIT" and trend != 0 and sign != trend
+    if counter and abs(total) < COUNTER_TREND_THRESHOLD:
+        flags.append(f"сигнал {signal} против тренда слишком слабый, отклонён")
+        signal = "WAIT"
+    elif counter:
+        confidence = int(confidence * 0.75)
+        flags.append("⚠️ сделка против тренда")
+    elif signal != "WAIT" and trend != 0:
+        flags.append("✅ по тренду")
+
+    if signal != "WAIT":
+        # 2) конфликты и перегретость
+        if agree < 3:
+            confidence = min(confidence, 60)
+            flags.append("⚠️ мало подтверждений (согласны <3 компонентов)")
+        rv = rsi(df["Close"]).iloc[-1]
+        if (signal == "SELL" and rv < 30) or (signal == "BUY" and rv > 70):
+            confidence -= 10
+            flags.append("⚠️ RSI в экстремуме против сигнала (возможен отскок)")
+
+        # 3) подтверждение другим таймфреймом
+        try:
+            other = "4h" if tf == "1d" else "1d"
+            t2, _ = technical_score(fetch(ticker, other))
+            want = 1 if signal == "BUY" else -1
+            if t2 * want > 15:
+                confidence += 8
+                flags.append(f"✅ {other} подтверждает")
+            elif t2 * want < -15:
+                confidence -= 15
+                flags.append(f"⚠️ {other} против сигнала")
+        except Exception:
+            pass
+
+        # 4) экономический календарь
+        ev = upcoming_events({base, quote})
+        if ev:
+            confidence -= 20
+            flags.append("⚠️ важные новости: " + "; ".join(
+                f"{c} {t} через {h:.0f}ч" for h, c, t in ev[:3]))
+            if ev[0][0] < CALENDAR_BLOCK_HOURS:
+                flags.append("вход отменён: новость меньше чем через 3 часа")
+                signal = "WAIT"
+
+    confidence = int(max(0, min(100, confidence)))
     price, a = df["Close"].iloc[-1], atr(df).iloc[-1]
     sl = tp = None
     if signal == "BUY":
@@ -276,7 +372,7 @@ def analyze(name, ticker, tf):
         sl, tp = price + 1.5 * a, price - 3 * a
 
     return dict(pair=name, price=price, signal=signal, total=total, confidence=confidence,
-                agree=agree, parts=parts, sl=sl, tp=tp,
+                agree=agree, parts=parts, sl=sl, tp=tp, flags=flags,
                 notes=tn + cn + pn + fn + sn, heads=heads)
 
 
@@ -289,6 +385,7 @@ def render_html(results, tf):
                  f"{r['signal']}</span></h2><p>Цена {r['price']:.5f} · уверенность {r['confidence']}% · "
                  f"итог {r['total']:+.0f}</p><p>{lv}</p>"
                  f"<p>{' · '.join(f'{k} {v:+.0f}' for k, v in r['parts'].items())}</p>"
+                 f"<p>{'<br>'.join(html.escape(x) for x in r['flags'])}</p>"
                  f"<ul>{''.join(f'<li>{html.escape(n)}</li>' for n in r['notes'])}</ul>"
                  f"<small>{'<br>'.join(html.escape(h) for h in r['heads'])}</small></div>")
     return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
@@ -324,8 +421,9 @@ def telegram_text(results, tf):
         return head + f"\nСегодня чётких сигналов нет, ждём: {waits}"
     blocks = []
     for r in active:
+        flag_text = "".join(x + "\n" for x in r["flags"])
         b = (f"{icons[r['signal']]} {r['signal']} {r['pair']}\n"
-             f"Цена: {r['price']:.5f}\nУверенность: {r['confidence']}%\n"
+             f"Цена: {r['price']:.5f}\nУверенность: {r['confidence']}%\n{flag_text}"
              f"SL: {r['sl']:.5f}  TP: {r['tp']:.5f}\n"
              f"Причины: " + "; ".join(r["notes"][:5]))
         blocks.append(b)
@@ -350,6 +448,8 @@ def main():
     for r in results:
         print(f"\n{r['pair']}  {r['signal']}  (уверенность {r['confidence']}%, итог {r['total']:+.0f})")
         print("  " + " | ".join(f"{k} {v:+.0f}" for k, v in r["parts"].items()))
+        for fl in r["flags"]:
+            print("  ", fl)
         if r["sl"]:
             print(f"  вход ~{r['price']:.5f}  SL {r['sl']:.5f}  TP {r['tp']:.5f}")
         for n in r["notes"]:
