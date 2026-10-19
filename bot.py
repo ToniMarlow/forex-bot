@@ -11,10 +11,10 @@ Telegram-бот по форексу: работает сам, 24/7 (нужен �
   - журнал сигналов: бот сам проверяет, чем закончились прошлые сигналы,
     и раз в неделю (понедельник) присылает итоги.
 
-Правила сигналов (отобраны бэктестом на 5 годах дневок, см. backtest2.py):
-  1) цена пересекла EMA50 (SL 2 ATR / TP 4 ATR)
-  2) пересечение MACD      (SL 1.5 ATR / TP 3 ATR)
-  3) разворот по RSI 30/70 (SL 2 ATR / TP 4 ATR)
+Правила сигналов (бэктест на 10 годах дневок, см. backtest4.py):
+  1) цена пересекла EMA50        (SL 2 ATR / TP 4 ATR) - основное
+  2) Stochastic вошёл в зону 20/80 (SL 2 ATR / TP 4 ATR) - основное
+  3) разворот по RSI 30/70       (SL 2 ATR / TP 4 ATR) - слабее
 
 Переменные окружения:
   TELEGRAM_BOT_TOKEN  токен бота (обязательно)
@@ -47,14 +47,14 @@ CACHE_SECONDS = 600
 
 RULES = {
     "ema50": dict(title="Цена пересекла EMA50", sl=2.0, tp=4.0,
-                  bt="Бэктест 5 лет: ~53% прибыльных, около +0.2R на сделку"),
-    "macd": dict(title="Пересечение MACD", sl=1.5, tp=3.0,
-                 bt="Бэктест 5 лет: ~45% прибыльных, около +0.1R на сделку"),
+                  bt="Бэктест 10 лет: ~50% прибыльных, около +0.1R на сделку"),
+    "stoch": dict(title="Stochastic 20/80", sl=2.0, tp=4.0,
+                  bt="Бэктест 10 лет: ~49% прибыльных, около +0.1R на сделку"),
     "rsi": dict(title="Разворот по RSI (30/70)", sl=2.0, tp=4.0,
-                bt="Бэктест 5 лет: ~52% прибыльных, около +0.2R на сделку"),
+                bt="Бэктест 10 лет: ~47% прибыльных, около +0.06R (слабее)"),
 }
 ICON = {1: "🟢 BUY", -1: "🔴 SELL"}
-SHORT = {"ema50": "EMA50", "macd": "MACD", "rsi": "RSI"}
+SHORT = {"ema50": "EMA50", "stoch": "Stochastic", "rsi": "RSI"}
 AGE = {0: "на последней закрытой свече", 1: "1 день назад", 2: "2 дня назад"}
 KEY = {p.replace("/", ""): p for p in fa.PAIRS}
 
@@ -155,7 +155,7 @@ def _solve(f, lo, hi, target):
     return hi
 
 
-def calc_triggers(df, rv_last, hist_last, atr):
+def calc_triggers(df, rv_last, k_last, atr):
     """Цены, за которыми ДНЕВНАЯ свеча должна закрыться, чтобы сработало правило."""
     c = df["Close"]
     close = float(c.iloc[-1])
@@ -166,20 +166,25 @@ def calc_triggers(df, rv_last, hist_last, atr):
     sd = -1 if close > e50 else 1
     out.append(dict(rule="ema50", dir=sd, side=sd, level=e50))
 
-    # 2) MACD: гистограмма линейна по цене закрытия, решаем hist(x)=0
-    a12, a26, a9 = 2 / 13, 2 / 27, 2 / 10
-    e12, e26 = float(fa.ema(c, 12).iloc[-1]), float(fa.ema(c, 26).iloc[-1])
-    sg = float(fa.ema(fa.ema(c, 12) - fa.ema(c, 26), 9).iloc[-1])
+    # 2) Stochastic: считаем %K завтрашней свечи, считая её диапазон минимальным
+    #    (от вчерашнего закрытия до цены закрытия), поэтому уровень приблизительный
+    hi, lo = df["High"], df["Low"]
+    ll14, hh14 = lo.rolling(14).min(), hi.rolling(14).max()
+    raw = (c - ll14) / (hh14 - ll14).replace(0, np.nan) * 100
+    r1, r2 = float(raw.iloc[-1]), float(raw.iloc[-2])
+    hh13, ll13 = float(hi.iloc[-13:].max()), float(lo.iloc[-13:].min())
 
-    def hist_at(x):
-        m = (a12 * x + (1 - a12) * e12) - (a26 * x + (1 - a26) * e26)
-        return m - (a9 * m + (1 - a9) * sg)
+    def k_at(x):
+        hh, ll = max(hh13, x, close), min(ll13, x, close)
+        rawx = 100 * (x - ll) / (hh - ll) if hh > ll else 50.0
+        return (r1 + r2 + rawx) / 3
 
-    h0 = hist_at(close)
-    slope = hist_at(close + 1.0) - h0
-    if slope > 0:
-        sd = -1 if hist_last > 0 else 1
-        out.append(dict(rule="macd", dir=sd, side=sd, level=close - h0 / slope))
+    lo_x, hi_x = close - 10 * atr, close + 10 * atr
+    if np.isfinite(r1) and np.isfinite(r2) and np.isfinite(k_last):
+        if k_last >= 20 and k_at(lo_x) <= 20 < k_at(hi_x):
+            out.append(dict(rule="stoch", dir=1, side=-1, level=_solve(k_at, lo_x, hi_x, 20)))
+        if k_last <= 80 and k_at(lo_x) < 80 <= k_at(hi_x):
+            out.append(dict(rule="stoch", dir=-1, side=1, level=_solve(k_at, lo_x, hi_x, 80)))
 
     # 3) RSI: цена, при которой RSI на закрытии пересечёт 70 (SELL) или 30 (BUY)
     d = c.diff()
@@ -206,11 +211,11 @@ def analyze_pair(pair, force=False):
     c = df["Close"]
     e50 = fa.ema(c, 50)
     rv = fa.rsi(c).values
-    macd = fa.ema(c, 12) - fa.ema(c, 26)
-    hist = (macd - fa.ema(macd, 9)).values
+    ll14, hh14 = df["Low"].rolling(14).min(), df["High"].rolling(14).max()
+    kv = ((c - ll14) / (hh14 - ll14).replace(0, np.nan) * 100).rolling(3).mean().values
     states = {
         "ema50": np.sign((c - e50).values),
-        "macd": np.sign(hist),
+        "stoch": np.where(kv < 20, 1, np.where(kv > 80, -1, 0)),
         "rsi": np.where(rv < 30, 1, np.where(rv > 70, -1, 0)),
     }
     n, events = len(df), []
@@ -226,14 +231,14 @@ def analyze_pair(pair, force=False):
     base, quote = pair.split("/")
     price, atr_v = float(full["Close"].iloc[-1]), float(fa.atr(df).iloc[-1])
     trig = []
-    for t in calc_triggers(df, float(rv[-1]), float(hist[-1]), atr_v):
+    for t in calc_triggers(df, float(rv[-1]), float(kv[-1]), atr_v):
         if abs(t["level"] - price) <= 3 * atr_v:
             t["past"] = (price > t["level"]) if t["side"] == 1 else (price < t["level"])
             trig.append(t)
     trig.sort(key=lambda t: abs(t["level"] - price))
     res = dict(pair=pair, price=price, atr=atr_v, bar=df.index[-1].strftime("%Y-%m-%d"),
                events=events, rsi=float(rv[-1]), ema_side=int(states["ema50"][-1]),
-               macd_side=int(states["macd"][-1]), trend=fa.trend_dir(df), triggers=trig,
+               stoch=float(kv[-1]), trend=fa.trend_dir(df), triggers=trig,
                asof=dt.datetime.now(dt.timezone.utc).strftime("%d.%m %H:%M UTC"),
                news=fa.upcoming_events({base, quote}))
     _cache[pair] = (now, res)
@@ -253,7 +258,7 @@ def trig_lines(res, limit=4):
         where = "выше" if t["side"] == 1 else "ниже"
         note = "цена уже за уровнем, ждём закрытие дня" if t["past"] else \
             f"{abs(t['level'] - p) / PIP:.0f} п. от цены"
-        out.append(f"{ICON[d]} если день закроется {where} {fmt(t['level'])} ({SHORT[t['rule']]}, {note})")
+        out.append(f"{ICON[d]} если день закроется {where} {fmt(t['level'])} ({SHORT[t['rule']]}{', ≈' if t['rule'] == 'stoch' else ''}, {note})")
         out.append(f"   SL {fmt(sl)}  TP {fmt(tp)}")
     return out
 
@@ -262,7 +267,7 @@ def pair_text(res, with_triggers=True):
     p, price, a = res["pair"], res["price"], res["atr"]
     tr = {1: "вверх", -1: "вниз", 0: "смешанный"}[res["trend"]]
     lines = [f"📊 {p}   {fmt(price)}   ({res['asof']})",
-             f"Тренд {tr} · цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50 · RSI {res['rsi']:.0f}", ""]
+             f"Тренд {tr} · цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50 · RSI {res['rsi']:.0f} · Stoch {res['stoch']:.0f}", ""]
     if res["events"]:
         lines.append("✅ Свежий сигнал:")
         for e in res["events"]:
@@ -417,8 +422,9 @@ MAIN_KB = {"inline_keyboard": [
 HELP = (
     "ℹ️ Как это работает\n\n"
     "Бот смотрит дневные свечи по 5 парам и ищет сигналы по трём правилам, "
-    "которые прошли проверку на 5 годах истории:\n"
-    "1) цена пересекла EMA50\n2) пересечение MACD\n3) разворот по RSI (30/70)\n\n"
+    "проверенным на 10 годах истории:\n"
+    "1) цена пересекла EMA50 (основное)\n2) Stochastic вошёл в зону 20/80 (основное)\n"
+    "3) разворот по RSI 30/70 (слабее)\n\n"
     "«Проверить пару» — каждый раз новый расчёт: свежие сигналы, цены, за которыми "
     "закрытие дня даст сигнал, уровни SL/TP и важные новости.\n"
     f"«Мои пары» — выбери, по каким парам получать ежедневный разбор "
