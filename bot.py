@@ -54,6 +54,7 @@ RULES = {
                 bt="Бэктест 5 лет: ~52% прибыльных, около +0.2R на сделку"),
 }
 ICON = {1: "🟢 BUY", -1: "🔴 SELL"}
+SHORT = {"ema50": "EMA50", "macd": "MACD", "rsi": "RSI"}
 AGE = {0: "на последней закрытой свече", 1: "1 день назад", 2: "2 дня назад"}
 KEY = {p.replace("/", ""): p for p in fa.PAIRS}
 
@@ -143,6 +144,60 @@ def load(pair):
     return full, df
 
 
+def _solve(f, lo, hi, target):
+    """f возрастает; ищем x, где f(x) впервые достигает target."""
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if f(mid) >= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def calc_triggers(df, rv_last, hist_last, atr):
+    """Цены, за которыми ДНЕВНАЯ свеча должна закрыться, чтобы сработало правило."""
+    c = df["Close"]
+    close = float(c.iloc[-1])
+    out = []
+
+    # 1) EMA50: знак (close - EMA50) меняется ровно на уровне прошлой EMA50
+    e50 = float(fa.ema(c, 50).iloc[-1])
+    sd = -1 if close > e50 else 1
+    out.append(dict(rule="ema50", dir=sd, side=sd, level=e50))
+
+    # 2) MACD: гистограмма линейна по цене закрытия, решаем hist(x)=0
+    a12, a26, a9 = 2 / 13, 2 / 27, 2 / 10
+    e12, e26 = float(fa.ema(c, 12).iloc[-1]), float(fa.ema(c, 26).iloc[-1])
+    sg = float(fa.ema(fa.ema(c, 12) - fa.ema(c, 26), 9).iloc[-1])
+
+    def hist_at(x):
+        m = (a12 * x + (1 - a12) * e12) - (a26 * x + (1 - a26) * e26)
+        return m - (a9 * m + (1 - a9) * sg)
+
+    h0 = hist_at(close)
+    slope = hist_at(close + 1.0) - h0
+    if slope > 0:
+        sd = -1 if hist_last > 0 else 1
+        out.append(dict(rule="macd", dir=sd, side=sd, level=close - h0 / slope))
+
+    # 3) RSI: цена, при которой RSI на закрытии пересечёт 70 (SELL) или 30 (BUY)
+    d = c.diff()
+    up = float(d.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+    dn = float((-d.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+
+    def rsi_at(x):
+        dd = x - close
+        u, v = up * 13 / 14 + max(dd, 0) / 14, dn * 13 / 14 + max(-dd, 0) / 14
+        return 100.0 if v <= 0 else 100 - 100 / (1 + u / v)
+
+    if rv_last <= 70 and rsi_at(close + 10 * atr) >= 70:
+        out.append(dict(rule="rsi", dir=-1, side=1, level=_solve(rsi_at, close, close + 10 * atr, 70)))
+    if rv_last >= 30 and rsi_at(close - 10 * atr) <= 30:
+        out.append(dict(rule="rsi", dir=1, side=-1, level=_solve(rsi_at, close - 10 * atr, close, 30)))
+    return out
+
+
 def analyze_pair(pair, force=False):
     now = time.time()
     if not force and pair in _cache and now - _cache[pair][0] < CACHE_SECONDS:
@@ -169,10 +224,18 @@ def analyze_pair(pair, force=False):
                                    bar=df.index[i].strftime("%Y-%m-%d"), entry=float(c.iloc[i])))
                 break
     base, quote = pair.split("/")
-    res = dict(pair=pair, price=float(full["Close"].iloc[-1]), atr=float(fa.atr(df).iloc[-1]),
-               bar=df.index[-1].strftime("%Y-%m-%d"), events=events, rsi=float(rv[-1]),
-               ema_side=int(states["ema50"][-1]), macd_side=int(states["macd"][-1]),
-               trend=fa.trend_dir(df), news=fa.upcoming_events({base, quote}))
+    price, atr_v = float(full["Close"].iloc[-1]), float(fa.atr(df).iloc[-1])
+    trig = []
+    for t in calc_triggers(df, float(rv[-1]), float(hist[-1]), atr_v):
+        if abs(t["level"] - price) <= 3 * atr_v:
+            t["past"] = (price > t["level"]) if t["side"] == 1 else (price < t["level"])
+            trig.append(t)
+    trig.sort(key=lambda t: abs(t["level"] - price))
+    res = dict(pair=pair, price=price, atr=atr_v, bar=df.index[-1].strftime("%Y-%m-%d"),
+               events=events, rsi=float(rv[-1]), ema_side=int(states["ema50"][-1]),
+               macd_side=int(states["macd"][-1]), trend=fa.trend_dir(df), triggers=trig,
+               asof=dt.datetime.now(dt.timezone.utc).strftime("%d.%m %H:%M UTC"),
+               news=fa.upcoming_events({base, quote}))
     _cache[pair] = (now, res)
     return res
 
@@ -181,28 +244,41 @@ def levels(price, atr, d, sl_a, tp_a):
     return price - d * sl_a * atr, price + d * tp_a * atr
 
 
-def pair_text(res):
+def trig_lines(res, limit=4):
+    out, p, a = [], res["price"], res["atr"]
+    for t in res["triggers"][:limit]:
+        d, rule = t["dir"], RULES[t["rule"]]
+        entry = p if t["past"] else t["level"]
+        sl, tp = levels(entry, a, d, rule["sl"], rule["tp"])
+        where = "выше" if t["side"] == 1 else "ниже"
+        note = "цена уже за уровнем, ждём закрытие дня" if t["past"] else \
+            f"{abs(t['level'] - p) / PIP:.0f} п. от цены"
+        out.append(f"{ICON[d]} если день закроется {where} {fmt(t['level'])} ({SHORT[t['rule']]}, {note})")
+        out.append(f"   SL {fmt(sl)}  TP {fmt(tp)}")
+    return out
+
+
+def pair_text(res, with_triggers=True):
     p, price, a = res["pair"], res["price"], res["atr"]
     tr = {1: "вверх", -1: "вниз", 0: "смешанный"}[res["trend"]]
-    lines = [f"📊 {p}   {fmt(price)}",
-             f"Дневная свеча закрыта: {res['bar']} · ATR {fmt(a)}", "",
-             f"Тренд (EMA20/50/200): {tr}",
-             f"Цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50 · "
-             f"MACD {'выше' if res['macd_side'] > 0 else 'ниже'} сигнальной · RSI {res['rsi']:.0f}", ""]
+    lines = [f"📊 {p}   {fmt(price)}   ({res['asof']})",
+             f"Тренд {tr} · цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50 · RSI {res['rsi']:.0f}", ""]
     if res["events"]:
+        lines.append("✅ Свежий сигнал:")
         for e in res["events"]:
             rule = RULES[e["rule"]]
             sl, tp = levels(price, a, e["dir"], rule["sl"], rule["tp"])
-            lines += [f"{ICON[e['dir']]}: {rule['title']} ({AGE[e['age']]})",
-                      f"   Вход ~{fmt(price)}  SL {fmt(sl)}  TP {fmt(tp)}",
-                      f"   {rule['bt']}"]
+            when = "" if e["age"] == 0 else f", {AGE[e['age']]}"
+            lines += [f"{ICON[e['dir']]} — {SHORT[e['rule']]}{when}",
+                      f"   Вход ~{fmt(price)}  SL {fmt(sl)}  TP {fmt(tp)}"]
     else:
-        lines.append("Свежих сигналов по правилам нет.")
+        lines.append("Свежего сигнала нет.")
+    if with_triggers and res["triggers"]:
+        lines += ["", "🎯 Что ждать (закрытие дневной свечи за уровнем):"] + trig_lines(res)
     bs, bt = levels(price, a, 1, 2, 4)
     ss, st = levels(price, a, -1, 2, 4)
-    lines += ["", "Если входишь по своему анализу (SL 2 ATR, TP 4 ATR):",
-              f"   BUY:  SL {fmt(bs)}  TP {fmt(bt)}",
-              f"   SELL: SL {fmt(ss)}  TP {fmt(st)}"]
+    lines += ["", "Своя сделка от текущей цены (SL 2 ATR, TP 4 ATR):",
+              f"   BUY  SL {fmt(bs)}  TP {fmt(bt)}", f"   SELL SL {fmt(ss)}  TP {fmt(st)}"]
     if res["news"]:
         lines += ["", "⚠️ Важные новости: " + "; ".join(f"{c} {t} через {h:.0f}ч" for h, c, t in res["news"][:3])]
     lines += ["", "Не финансовая рекомендация. Используй стоп-лосс."]
@@ -210,8 +286,11 @@ def pair_text(res):
 
 
 def one_line(res):
-    side = "выше" if res["ema_side"] > 0 else "ниже"
-    return f"⚪ {res['pair']}: сигнала нет · {fmt(res['price'])} · {side} EMA50, RSI {res['rsi']:.0f}"
+    s = f"⚪ {res['pair']}: сигнала нет · {fmt(res['price'])} · RSI {res['rsi']:.0f}"
+    if res["triggers"]:
+        t = res["triggers"][0]
+        s += f"\n   ближайший: {'BUY' if t['dir'] == 1 else 'SELL'} {'выше' if t['side'] == 1 else 'ниже'} {fmt(t['level'])} ({SHORT[t['rule']]})"
+    return s
 
 
 # ------------------------- ЖУРНАЛ СИГНАЛОВ -------------------------
@@ -299,7 +378,7 @@ def run_daily():
         head = f"🌅 Ежедневный разбор {today.date()}"
         parts = [head]
         for p in sig:
-            parts.append(pair_text({**data[p], "events": [e for e in data[p]["events"] if e["age"] == 0]}))
+            parts.append(pair_text({**data[p], "events": [e for e in data[p]["events"] if e["age"] == 0]}, with_triggers=False))
         quiet = [one_line(data[p]) for p in pairs if p not in sig]
         if quiet:
             parts.append("\n".join(quiet))
@@ -340,8 +419,8 @@ HELP = (
     "Бот смотрит дневные свечи по 5 парам и ищет сигналы по трём правилам, "
     "которые прошли проверку на 5 годах истории:\n"
     "1) цена пересекла EMA50\n2) пересечение MACD\n3) разворот по RSI (30/70)\n\n"
-    "«Проверить пару» — мгновенные данные: цена, состояние правил, уровни SL/TP "
-    "и важные новости.\n"
+    "«Проверить пару» — каждый раз новый расчёт: свежие сигналы, цены, за которыми "
+    "закрытие дня даст сигнал, уровни SL/TP и важные новости.\n"
     f"«Мои пары» — выбери, по каким парам получать ежедневный разбор "
     f"({DAILY_HOUR_UTC:02d}:00 UTC, в будни).\n"
     "«Статистика» — как закончились прошлые сигналы бота.\n\n"
@@ -406,7 +485,7 @@ def handle_callback(cb):
         kb = {"inline_keyboard": [[btn("🔄 Обновить", data)], [btn("⬅️ К парам", "menu")]]}
         edit(chat_id, msg_id, f"⏳ Считаю {pair}…")
         try:
-            edit(chat_id, msg_id, pair_text(analyze_pair(pair)), kb)
+            edit(chat_id, msg_id, pair_text(analyze_pair(pair, force=True)), kb)
         except Exception as e:
             log(f"{pair}: {e}")
             edit(chat_id, msg_id, f"Не удалось получить данные по {pair}. Попробуй через минуту.", kb)
