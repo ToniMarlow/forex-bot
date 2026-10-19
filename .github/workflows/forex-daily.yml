@@ -1,0 +1,25 @@
+name: Forex daily analysis
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # каждый день в 02:00 UTC (07:00 по Ташкенту)
+  workflow_dispatch:       # ручной запуск кнопкой
+    inputs:
+      tf:
+        description: "Таймфрейм (1d или 4h)"
+        default: "1d"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run analysis
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python forex_analyzer.py --tf ${{ github.event.inputs.tf || '1d' }}
