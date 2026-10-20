@@ -23,6 +23,7 @@ Telegram-бот по форексу: работает сам, 24/7 (нужен �
   DB_PATH             путь к базе (по умолчанию /data/bot.db, если есть папка /data)
 """
 import datetime as dt
+import html
 import json
 import os
 import sqlite3
@@ -79,6 +80,10 @@ def init_db():
         status TEXT DEFAULT 'open', r REAL, UNIQUE(pair, rule, bar_date));
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
     """)
+    try:
+        db.execute("ALTER TABLE users ADD COLUMN kb INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     db.commit()
 
 
@@ -125,11 +130,12 @@ def api(method, **params):
 
 
 def send(chat_id, text, kb=None):
-    return api("sendMessage", chat_id=chat_id, text=text[:4000], reply_markup=kb)
+    return api("sendMessage", chat_id=chat_id, text=text[:4000], reply_markup=kb, parse_mode="HTML")
 
 
 def edit(chat_id, msg_id, text, kb=None):
-    return api("editMessageText", chat_id=chat_id, message_id=msg_id, text=text[:4000], reply_markup=kb)
+    return api("editMessageText", chat_id=chat_id, message_id=msg_id, text=text[:4000], reply_markup=kb,
+               parse_mode="HTML")
 
 
 # ------------------------- АНАЛИЗ -------------------------
@@ -249,6 +255,28 @@ def levels(price, atr, d, sl_a, tp_a):
     return price - d * sl_a * atr, price + d * tp_a * atr
 
 
+EVENT_WHY = {
+    ("ema50", 1): "цена закрылась выше EMA50, разворот вверх",
+    ("ema50", -1): "цена закрылась ниже EMA50, разворот вниз",
+    ("stoch", 1): "Stochastic вошёл в зону перепроданности (ниже 20), ждём отскок вверх",
+    ("stoch", -1): "Stochastic вошёл в зону перекупленности (выше 80), ждём откат вниз",
+    ("rsi", 1): "RSI упал ниже 30 (перепроданность), ждём отскок вверх",
+    ("rsi", -1): "RSI поднялся выше 70 (перекупленность), ждём откат вниз",
+}
+WAIT_WHY = {
+    ("ema50", 1): "EMA50: цена вернётся выше средней, разворот вверх",
+    ("ema50", -1): "EMA50: цена уйдёт ниже средней, разворот вниз",
+    ("stoch", 1): "Stochastic: уйдёт в зону перепроданности (ниже 20), ждём отскок",
+    ("stoch", -1): "Stochastic: уйдёт в зону перекупленности (выше 80), ждём откат",
+    ("rsi", 1): "RSI: упадёт ниже 30 (перепроданность), ждём отскок",
+    ("rsi", -1): "RSI: поднимется выше 70 (перекупленность), ждём откат",
+}
+
+
+def code(x):
+    return f"<code>{fmt(x)}</code>"
+
+
 def trig_lines(res, limit=4):
     out, p, a = [], res["price"], res["atr"]
     for t in res["triggers"][:limit]:
@@ -256,45 +284,54 @@ def trig_lines(res, limit=4):
         entry = p if t["past"] else t["level"]
         sl, tp = levels(entry, a, d, rule["sl"], rule["tp"])
         where = "выше" if t["side"] == 1 else "ниже"
+        action = "Покупка" if d == 1 else "Продажа"
         note = "цена уже за уровнем, ждём закрытие дня" if t["past"] else \
             f"{abs(t['level'] - p) / PIP:.0f} п. от цены"
-        out.append(f"{ICON[d]} если день закроется {where} {fmt(t['level'])} ({SHORT[t['rule']]}{', ≈' if t['rule'] == 'stoch' else ''}, {note})")
-        out.append(f"   SL {fmt(sl)}  TP {fmt(tp)}")
-    return out
+        approx = " (уровень приблизительный)" if t["rule"] == "stoch" else ""
+        out += [f"{'🟢' if d == 1 else '🔴'} <b>{action}</b>, если свеча закроется <b>{where}</b> {code(t['level'])}",
+                f"   {WAIT_WHY[(t['rule'], d)]}{approx}",
+                f"   {note}",
+                f"   SL {code(sl)} · TP {code(tp)}", ""]
+    return out[:-1] if out else out
 
 
 def pair_text(res, with_triggers=True):
     p, price, a = res["pair"], res["price"], res["atr"]
     tr = {1: "вверх", -1: "вниз", 0: "смешанный"}[res["trend"]]
-    lines = [f"📊 {p}   {fmt(price)}   ({res['asof']})",
-             f"Тренд {tr} · цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50 · RSI {res['rsi']:.0f} · Stoch {res['stoch']:.0f}", ""]
+    lines = [f"📊 <b>{p}</b> · {code(price)}", f"<i>обновлено {res['asof']}</i>", "",
+             f"<b>Рынок:</b> тренд {tr}, цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50, "
+             f"RSI {res['rsi']:.0f}, Stochastic {res['stoch']:.0f}", ""]
     if res["events"]:
-        lines.append("✅ Свежий сигнал:")
+        lines.append("✅ <b>Есть сигнал</b>")
         for e in res["events"]:
             rule = RULES[e["rule"]]
             sl, tp = levels(price, a, e["dir"], rule["sl"], rule["tp"])
-            when = "" if e["age"] == 0 else f", {AGE[e['age']]}"
-            lines += [f"{ICON[e['dir']]} — {SHORT[e['rule']]}{when}",
-                      f"   Вход ~{fmt(price)}  SL {fmt(sl)}  TP {fmt(tp)}"]
+            when = "" if e["age"] == 0 else f" ({AGE[e['age']]})"
+            lines += [f"{ICON[e['dir']].replace(' ', ' <b>')}</b> · {EVENT_WHY[(e['rule'], e['dir'])]}{when}",
+                      f"Вход {code(price)} · SL {code(sl)} · TP {code(tp)}"]
+        lines.append("Риск : цель = 1 : 2: если сделка пойдёт против тебя, потеря около 1R, цель около 2R.")
     else:
-        lines.append("Свежего сигнала нет.")
+        lines.append("Сейчас сигнала нет.")
     if with_triggers and res["triggers"]:
-        lines += ["", "🎯 Что ждать (закрытие дневной свечи за уровнем):"] + trig_lines(res)
+        lines += ["", "🎯 <b>Что ждать</b> (смотрим, где закроется дневная свеча):", ""] + trig_lines(res)
     bs, bt = levels(price, a, 1, 2, 4)
     ss, st = levels(price, a, -1, 2, 4)
-    lines += ["", "Своя сделка от текущей цены (SL 2 ATR, TP 4 ATR):",
-              f"   BUY  SL {fmt(bs)}  TP {fmt(bt)}", f"   SELL SL {fmt(ss)}  TP {fmt(st)}"]
+    lines += ["", "<b>Если входишь сам</b> (SL 2 ATR, TP 4 ATR):",
+              f"🟢 Покупка: SL {code(bs)} · TP {code(bt)}",
+              f"🔴 Продажа: SL {code(ss)} · TP {code(st)}"]
     if res["news"]:
-        lines += ["", "⚠️ Важные новости: " + "; ".join(f"{c} {t} через {h:.0f}ч" for h, c, t in res["news"][:3])]
-    lines += ["", "Не финансовая рекомендация. Используй стоп-лосс."]
+        lines += ["", "⚠️ <b>Важные новости:</b> " + html.escape("; ".join(
+            f"{c} {t} через {h:.0f}ч" for h, c, t in res["news"][:3]))]
+    lines += ["", "<i>Не финансовая рекомендация. Используй стоп-лосс.</i>"]
     return "\n".join(lines)
 
 
 def one_line(res):
-    s = f"⚪ {res['pair']}: сигнала нет · {fmt(res['price'])} · RSI {res['rsi']:.0f}"
+    s = f"⚪ <b>{res['pair']}</b> · {code(res['price'])} · RSI {res['rsi']:.0f} — сигнала нет"
     if res["triggers"]:
         t = res["triggers"][0]
-        s += f"\n   ближайший: {'BUY' if t['dir'] == 1 else 'SELL'} {'выше' if t['side'] == 1 else 'ниже'} {fmt(t['level'])} ({SHORT[t['rule']]})"
+        s += (f"\n   ближайший: {'покупка' if t['dir'] == 1 else 'продажа'}, если свеча закроется "
+              f"{'выше' if t['side'] == 1 else 'ниже'} {code(t['level'])} ({SHORT[t['rule']]})")
     return s
 
 
@@ -340,7 +377,7 @@ def stats_text():
     rows = q("SELECT pair,rule,dir,bar_date,status,r FROM signals ORDER BY id")
     closed = [r for r in rows if r[4] == "closed"]
     opened = [r for r in rows if r[4] == "open"]
-    lines = ["📊 Журнал сигналов (с запуска бота, результат после спреда)", ""]
+    lines = ["📊 <b>Журнал сигналов</b> (с запуска бота, результат после спреда)", ""]
     if not closed:
         lines.append("Пока нет закрытых сигналов.")
     else:
@@ -380,16 +417,16 @@ def run_daily():
         if not pairs:
             continue
         sig = [p for p in pairs if any(e["age"] == 0 for e in data[p]["events"])]
-        head = f"🌅 Ежедневный разбор {today.date()}"
+        head = f"🌅 <b>Ежедневный разбор {today.date()}</b>"
         parts = [head]
         for p in sig:
             parts.append(pair_text({**data[p], "events": [e for e in data[p]["events"] if e["age"] == 0]}, with_triggers=False))
         quiet = [one_line(data[p]) for p in pairs if p not in sig]
         if quiet:
             parts.append("\n".join(quiet))
-        send(chat_id, "\n\n".join(parts), MAIN_KB)
+        send(chat_id, "\n\n———————\n\n".join(parts), MAIN_KB)
         if weekly:
-            send(chat_id, "📅 Итоги недели\n\n" + stats_text())
+            send(chat_id, "📅 <b>Итоги недели</b>\n\n" + stats_text())
     log("ежедневный разбор: готово")
 
 
@@ -456,6 +493,31 @@ SUBS_TEXT = ("⭐ Мои пары\n\nОтметь пары для ежеднев
              "можно в любой момент кнопкой «Проверить пару».")
 
 
+def reply_kb():
+    names = list(fa.PAIRS) + ["☰ Меню"]
+    rows = [[{"text": n} for n in names[i:i + 2]] for i in range(0, len(names), 2)]
+    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True}
+
+
+def pair_kb(pair):
+    return {"inline_keyboard": [[btn("🔄 Обновить", "p:" + pair.replace("/", ""))],
+                                [btn("⬅️ К парам", "menu")]]}
+
+
+def send_pair(chat_id, pair):
+    r = send(chat_id, f"⏳ Считаю {pair}…")
+    mid = ((r or {}).get("result") or {}).get("message_id")
+    try:
+        txt = pair_text(analyze_pair(pair, force=True))
+    except Exception as e:
+        log(f"{pair}: {e}")
+        txt = f"Не удалось получить данные по {pair}. Попробуй через минуту."
+    if mid:
+        edit(chat_id, mid, txt, pair_kb(pair))
+    else:
+        send(chat_id, txt, pair_kb(pair))
+
+
 def handle_message(m):
     chat_id = m["chat"]["id"]
     name = (m.get("from") or {}).get("first_name", "")
@@ -464,14 +526,27 @@ def handle_message(m):
         return
     new = ensure_user(chat_id, name)
     text = (m.get("text") or "").strip()
-    if text.startswith("/start") or new:
+    cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+    key = text.upper().replace("/", "").replace(" ", "")
+    if cmd == "/start" or new:
         send(chat_id, "👋 Привет! Я слежу за 5 валютными парами (GBP/USD, EUR/USD, GBP/AUD, "
                       "EUR/NZD, EUR/CAD) и присылаю сигналы.\n\nТы уже подписан на ежедневный "
                       "разбор по всем парам. Что делаем?", MAIN_KB)
-    elif text.startswith("/help"):
+    elif cmd == "/help":
         send(chat_id, HELP, MAIN_KB)
+    elif cmd == "/stats":
+        send(chat_id, stats_text(), MAIN_KB)
+    elif cmd == "/pairs":
+        send(chat_id, "Выбери пару:", pairs_kb())
+    elif key in KEY:
+        send_pair(chat_id, KEY[key])
     else:
         send(chat_id, "Выбери действие:", MAIN_KB)
+    row = q("SELECT kb FROM users WHERE chat_id=?", (chat_id,))
+    if row and row[0][0] == 0:
+        q("UPDATE users SET kb=1 WHERE chat_id=?", (chat_id,))
+        send(chat_id, "⌨️ Внизу появилась панель с парами: нажми пару, и я сразу пришлю свежий разбор.",
+             reply_kb())
 
 
 def handle_callback(cb):
