@@ -16,6 +16,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import time
 import os
 import urllib.parse
 import urllib.request
@@ -267,18 +268,23 @@ def trend_dir(df):
 
 
 _calendar = None
+_calendar_t = 0.0
 
 
 def load_calendar():
-    global _calendar
-    if _calendar is not None:
+    """Календарь кэшируется на 6 часов (если загрузка не удалась, повтор через 15 минут)."""
+    global _calendar, _calendar_t
+    ttl = 6 * 3600 if _calendar else 900
+    if _calendar is not None and time.time() - _calendar_t < ttl:
         return _calendar
     try:
         req = urllib.request.Request(CALENDAR_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=20) as r:
             _calendar = json.loads(r.read())
     except Exception:
-        _calendar = []
+        if _calendar is None:
+            _calendar = []
+    _calendar_t = time.time()
     return _calendar
 
 

@@ -20,6 +20,8 @@ Telegram-бот по форексу: работает сам, 24/7 (нужен �
   TELEGRAM_BOT_TOKEN  токен бота (обязательно)
   ALLOWED_USERS       необязательно: id через запятую, если бот должен быть закрытым
   DAILY_HOUR_UTC      час ежедневной рассылки по UTC (по умолчанию 2)
+  ADMIN_IDS           id администраторов через запятую (команда /status); по умолчанию = ALLOWED_USERS
+  ALERT_EVERY_SECONDS как часто проверять цену для оповещений (по умолчанию 300)
   DB_PATH             путь к базе (по умолчанию /data/bot.db, если есть папка /data)
 """
 import datetime as dt
@@ -33,6 +35,7 @@ import traceback
 import urllib.request
 
 import numpy as np
+import pandas as pd
 
 import forex_analyzer as fa
 
@@ -40,6 +43,8 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH") or ("/data/bot.db" if os.path.isdir("/data") else "bot.db")
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
 DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "2"))
+ADMIN = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x} or ALLOWED
+ALERT_EVERY = int(os.environ.get("ALERT_EVERY_SECONDS", "300"))   # как часто проверять цену для оповещений
 
 PIP = 0.0001
 SPREAD_PIPS = {"GBP/USD": 1.2, "EUR/USD": 0.9, "GBP/AUD": 2.8, "EUR/NZD": 3.5, "EUR/CAD": 2.5}
@@ -79,11 +84,15 @@ def init_db():
         bar_date TEXT, entry REAL, sl REAL, tp REAL, risk REAL, spread REAL,
         status TEXT DEFAULT 'open', r REAL, UNIQUE(pair, rule, bar_date));
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS alerts_sent(chat_id INTEGER, pair TEXT, key TEXT, day TEXT,
+        PRIMARY KEY(chat_id, pair, key, day));
     """)
-    try:
-        db.execute("ALTER TABLE users ADD COLUMN kb INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+    for col, ddl in (("kb", "INTEGER DEFAULT 0"), ("deposit", "REAL"),
+                     ("risk", "REAL DEFAULT 1"), ("alerts", "INTEGER DEFAULT 0")):
+        try:
+            db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+        except sqlite3.OperationalError:
+            pass
     db.commit()
 
 
@@ -129,12 +138,19 @@ def api(method, **params):
         return None
 
 
+def clip(text, limit=3900):
+    """Режем по строкам, чтобы не оборвать HTML-тег посередине."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit("\n", 1)[0] + "\n…"
+
+
 def send(chat_id, text, kb=None):
-    return api("sendMessage", chat_id=chat_id, text=text[:4000], reply_markup=kb, parse_mode="HTML")
+    return api("sendMessage", chat_id=chat_id, text=clip(text), reply_markup=kb, parse_mode="HTML")
 
 
 def edit(chat_id, msg_id, text, kb=None):
-    return api("editMessageText", chat_id=chat_id, message_id=msg_id, text=text[:4000], reply_markup=kb,
+    return api("editMessageText", chat_id=chat_id, message_id=msg_id, text=clip(text), reply_markup=kb,
                parse_mode="HTML")
 
 
@@ -144,7 +160,16 @@ def fmt(x):
 
 
 def load(pair):
-    full = fa.fetch(fa.PAIRS[pair], "1d", period="2y")
+    last = None
+    for attempt in range(3):
+        try:
+            full = fa.fetch(fa.PAIRS[pair], "1d", period="2y")
+            break
+        except Exception as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    else:
+        raise last
     today = dt.datetime.now(dt.timezone.utc).date()
     df = full.iloc[:-1] if full.index[-1].date() >= today else full
     return full, df
@@ -277,7 +302,7 @@ def code(x):
     return f"<code>{fmt(x)}</code>"
 
 
-def trig_lines(res, limit=4):
+def trig_lines(res, limit=3, rk=None):
     out, p, a = [], res["price"], res["atr"]
     for t in res["triggers"][:limit]:
         d, rule = t["dir"], RULES[t["rule"]]
@@ -291,16 +316,16 @@ def trig_lines(res, limit=4):
         out += [f"{'🟢' if d == 1 else '🔴'} <b>{action}</b>, если свеча закроется <b>{where}</b> {code(t['level'])}",
                 f"   {WAIT_WHY[(t['rule'], d)]}{approx}",
                 f"   {note}",
-                f"   SL {code(sl)} · TP {code(tp)}", ""]
+                f"   SL {code(sl)} · TP {code(tp)}{lot_suffix(res['pair'], entry, sl, rk)}", ""]
     return out[:-1] if out else out
 
 
-def pair_text(res, with_triggers=True):
+def pair_text(res, with_triggers=True, rk=None):
     p, price, a = res["pair"], res["price"], res["atr"]
     tr = {1: "вверх", -1: "вниз", 0: "смешанный"}[res["trend"]]
-    lines = [f"📊 <b>{p}</b> · {code(price)}", f"<i>обновлено {res['asof']}</i>", "",
-             f"<b>Рынок:</b> тренд {tr}, цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50, "
-             f"RSI {res['rsi']:.0f}, Stochastic {res['stoch']:.0f}", ""]
+    lines = [f"📊 <b>{p}</b> · {code(price)}  <i>({res['asof']})</i>",
+             f"Тренд {tr} · цена {'выше' if res['ema_side'] > 0 else 'ниже'} EMA50 · "
+             f"RSI {res['rsi']:.0f} · Stoch {res['stoch']:.0f}", ""]
     if res["events"]:
         lines.append("✅ <b>Есть сигнал</b>")
         for e in res["events"]:
@@ -308,21 +333,25 @@ def pair_text(res, with_triggers=True):
             sl, tp = levels(price, a, e["dir"], rule["sl"], rule["tp"])
             when = "" if e["age"] == 0 else f" ({AGE[e['age']]})"
             lines += [f"{ICON[e['dir']].replace(' ', ' <b>')}</b> · {EVENT_WHY[(e['rule'], e['dir'])]}{when}",
-                      f"Вход {code(price)} · SL {code(sl)} · TP {code(tp)}"]
-        lines.append("Риск : цель = 1 : 2: если сделка пойдёт против тебя, потеря около 1R, цель около 2R.")
+                      f"Вход {code(price)} · SL {code(sl)} · TP {code(tp)}{lot_suffix(p, price, sl, rk)}"]
+        lines.append("Риск : цель = 1 : 2. Если сделка пойдёт против тебя, потеря около 1R, цель около 2R.")
     else:
-        lines.append("Сейчас сигнала нет.")
+        lines.append("⚪ Сигнала сейчас нет.")
     if with_triggers and res["triggers"]:
-        lines += ["", "🎯 <b>Что ждать</b> (смотрим, где закроется дневная свеча):", ""] + trig_lines(res)
+        lines += ["", "🎯 <b>Что ждать</b> (смотрим, где закроется дневная свеча):", ""] + trig_lines(res, rk=rk)
     bs, bt = levels(price, a, 1, 2, 4)
     ss, st = levels(price, a, -1, 2, 4)
-    lines += ["", "<b>Если входишь сам</b> (SL 2 ATR, TP 4 ATR):",
-              f"🟢 Покупка: SL {code(bs)} · TP {code(bt)}",
-              f"🔴 Продажа: SL {code(ss)} · TP {code(st)}"]
+    lines += ["", "<b>Свой вход</b> (SL 2 ATR · TP 4 ATR):",
+              f"🟢 Покупка: SL {code(bs)} · TP {code(bt)}{lot_suffix(p, price, bs, rk)}",
+              f"🔴 Продажа: SL {code(ss)} · TP {code(st)}{lot_suffix(p, price, ss, rk)}"]
     if res["news"]:
         lines += ["", "⚠️ <b>Важные новости:</b> " + html.escape("; ".join(
             f"{c} {t} через {h:.0f}ч" for h, c, t in res["news"][:3]))]
-    lines += ["", "<i>Не финансовая рекомендация. Используй стоп-лосс.</i>"]
+        if res["news"][0][0] <= fa.CALENDAR_BLOCK_HOURS:
+            lines.append("⛔ Новость совсем скоро: лучше подождать, спред и скачки цены вырастут.")
+    if rk is None:
+        lines += ["", "🧮 Задай депозит (/risk), и я буду писать объём лота под твой риск."]
+    lines += ["", "<i>Не финансовая рекомендация. Всегда ставь стоп-лосс.</i>"]
     return "\n".join(lines)
 
 
@@ -333,6 +362,182 @@ def one_line(res):
         s += (f"\n   ближайший: {'покупка' if t['dir'] == 1 else 'продажа'}, если свеча закроется "
               f"{'выше' if t['side'] == 1 else 'ниже'} {code(t['level'])} ({SHORT[t['rule']]})")
     return s
+
+
+# ------------------------- РИСК И ОБЪЁМ ЛОТА -------------------------
+CONV = {"AUD": ("AUDUSD=X", False), "NZD": ("NZDUSD=X", False), "CAD": ("USDCAD=X", True)}
+_conv = {}
+
+
+def usd_per_pip(pair):
+    """Стоимость 1 пункта для 1 стандартного лота (100 000), в долларах. Приблизительно."""
+    spec = CONV.get(pair.split("/")[1])
+    if spec is None:
+        return 10.0
+    tick, inv = spec
+    hit = _conv.get(tick)
+    if hit and time.time() - hit[0] < 1800:
+        rate = hit[1]
+    else:
+        rate = float(fa.fetch(tick, "1d", period="10d")["Close"].iloc[-1])
+        _conv[tick] = (time.time(), rate)
+    return 10.0 / rate if inv else 10.0 * rate
+
+
+def lots(pair, entry, sl, rk):
+    if not rk or not rk.get("deposit"):
+        return None
+    pips = abs(entry - sl) / PIP
+    if pips <= 0:
+        return None
+    try:
+        return rk["deposit"] * rk["risk"] / 100 / (pips * usd_per_pip(pair))
+    except Exception:
+        return None
+
+
+def lot_suffix(pair, entry, sl, rk):
+    v = lots(pair, entry, sl, rk)
+    if v is None:
+        return ""
+    return " · объём ≈ " + (f"{v:.2f} лота" if v >= 0.01 else "<0.01 лота (депозит мал для такого стопа)")
+
+
+def get_risk(chat_id):
+    r = q("SELECT deposit, risk FROM users WHERE chat_id=?", (chat_id,))
+    if not r or not r[0][0]:
+        return None
+    return {"deposit": float(r[0][0]), "risk": float(r[0][1] or 1)}
+
+
+def parse_num(text, lo, hi):
+    try:
+        v = float(text.replace(",", ".").replace(" ", "").replace("$", ""))
+    except ValueError:
+        return None
+    return v if lo <= v <= hi else None
+
+
+def risk_text(chat_id):
+    rk = get_risk(chat_id)
+    if rk:
+        cur = (f"Депозит: <b>${rk['deposit']:,.0f}</b> · риск на сделку: <b>{rk['risk']:g}%</b> "
+               f"(≈ ${rk['deposit'] * rk['risk'] / 100:,.0f})").replace(",", " ")
+    else:
+        cur = "Депозит пока не задан."
+    return ("🧮 <b>Риск и объём лота</b>\n\n" + cur + "\n\n"
+            "Когда депозит задан, под каждым SL я пишу, каким объёмом входить, чтобы при стоп-лоссе потерять "
+            "не больше выбранного процента депозита.\n"
+            "Расчёт приблизительный: стандартный лот 100 000, депозит в долларах. Общее правило: 1% на сделку "
+            "(не больше 2%).\n\nБыстро: <code>/risk 1000 1</code> (депозит 1000 $, риск 1%).")
+
+
+def risk_kb():
+    return {"inline_keyboard": [
+        [btn("0.5%", "r:0.5"), btn("1%", "r:1"), btn("2%", "r:2")],
+        [btn("✏️ Ввести депозит", "dep")],
+        [btn("⬅️ Меню", "main")]]}
+
+
+# ------------------------- ОПОВЕЩЕНИЯ О УРОВНЯХ -------------------------
+_live = {}
+
+
+def live_price(pair):
+    now = time.time()
+    hit = _live.get(pair)
+    if hit and now - hit[0] < 240:
+        return hit[1]
+    df = fa.yf.download(fa.PAIRS[pair], period="1d", interval="5m", progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError("нет данных")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    price = float(df["Close"].dropna().iloc[-1])
+    _live[pair] = (now, price)
+    return price
+
+
+def alert_text(res, t, price, rk):
+    d, rule = t["dir"], RULES[t["rule"]]
+    where = "выше" if t["side"] == 1 else "ниже"
+    action = "Покупка" if d == 1 else "Продажа"
+    sl, tp = levels(price, res["atr"], d, rule["sl"], rule["tp"])
+    return "\n".join([
+        f"🔔 <b>{res['pair']}</b>: цена {code(price)} дошла до уровня {code(t['level'])}",
+        WAIT_WHY[(t["rule"], d)],
+        f"Это ещё <b>не сигнал</b>: он появится, только если дневная свеча <b>закроется {where}</b> уровня "
+        f"(около 22:00 UTC).",
+        f"Если закроется: {action}, SL {code(sl)} · TP {code(tp)}{lot_suffix(res['pair'], price, sl, rk)}",
+    ])
+
+
+def alert_check_once():
+    wanted = {}
+    for chat_id, pair in q("SELECT u.chat_id, s.pair FROM users u JOIN subs s ON s.chat_id=u.chat_id "
+                           "WHERE u.alerts=1"):
+        wanted.setdefault(pair, []).append(chat_id)
+    day = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    for pair, chats in wanted.items():
+        try:
+            res = analyze_pair(pair)
+            price = live_price(pair)
+        except Exception as e:
+            log(f"оповещения {pair}: {e}")
+            continue
+        if not price or price <= 0 or abs(price - res["price"]) > 10 * res["atr"]:
+            log(f"оповещения {pair}: странная цена {price}, пропускаю")
+            continue
+        for t in res["triggers"]:
+            if not ((price >= t["level"]) if t["side"] == 1 else (price <= t["level"])):
+                continue
+            key = f"{t['rule']}:{t['dir']}:{t['level']:.4f}"
+            for chat_id in chats:
+                if q("SELECT 1 FROM alerts_sent WHERE chat_id=? AND pair=? AND key=? AND day=?",
+                     (chat_id, pair, key, day)):
+                    continue
+                q("INSERT OR IGNORE INTO alerts_sent VALUES(?,?,?,?)", (chat_id, pair, key, day))
+                send(chat_id, alert_text(res, t, price, get_risk(chat_id)))
+
+
+def alert_loop():
+    while True:
+        try:
+            if dt.datetime.now(dt.timezone.utc).weekday() < 5:
+                alert_check_once()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(ALERT_EVERY)
+
+
+# ------------------------- СТАТУС (для администратора) -------------------------
+def status_text():
+    users = q("SELECT COUNT(*) FROM users")[0][0]
+    alerts_on = q("SELECT COUNT(*) FROM users WHERE alerts=1")[0][0]
+    sig = q("SELECT COUNT(*), COALESCE(SUM(status='open'), 0) FROM signals")[0]
+    ok = os.path.abspath(DB_PATH).startswith("/data")
+    return "\n".join([
+        "🛠 <b>Статус бота</b>",
+        f"База: <code>{html.escape(DB_PATH)}</code>" + (" ✅" if ok else
+            "\n⚠️ Путь не /data. Если это не подключённый Volume, при каждом перезапуске журнал и подписки "
+            "будут стираться."),
+        f"Пользователей: {users} (оповещения включены у {alerts_on})",
+        f"Сигналов в журнале: {sig[0]} (открытых {sig[1]})",
+        f"Последняя рассылка: {get_meta('last_daily') or 'ещё не было'}",
+        f"Следующая: {DAILY_HOUR_UTC:02d}:00 UTC, по будням",
+        f"Проверка оповещений: каждые {max(ALERT_EVERY // 60, 1)} мин",
+    ])
+
+
+def overview_text():
+    lines = ["📋 <b>Обзор по всем парам</b>", ""]
+    for p in fa.PAIRS:
+        try:
+            lines.append(one_line(analyze_pair(p, force=True)))
+        except Exception as e:
+            log(f"{p}: {e}")
+            lines.append(f"⚠️ <b>{p}</b>: нет данных")
+    return "\n".join(lines + ["", "<i>Подробности по паре: «Проверить пару».</i>"])
 
 
 # ------------------------- ЖУРНАЛ СИГНАЛОВ -------------------------
@@ -399,6 +604,7 @@ def stats_text():
 
 # ------------------------- ЕЖЕДНЕВНАЯ РАССЫЛКА -------------------------
 def run_daily():
+    """True, если разбор выполнен (повторный запуск в тот же день не шлёт дубли)."""
     log("ежедневный разбор: старт")
     data = {}
     for p in fa.PAIRS:
@@ -407,27 +613,34 @@ def run_daily():
         except Exception as e:
             log(f"{p}: ошибка данных — {e}")
     if not data:
-        return
+        return False
     evaluate_open(data)
     record_signals(data)
     today = dt.datetime.now(dt.timezone.utc)
     weekly = today.weekday() == 0
+    day = today.date().isoformat()
     for (chat_id,) in q("SELECT chat_id FROM users WHERE daily=1"):
+        mark = f"daily_sent:{day}:{chat_id}"
+        if get_meta(mark) == "1":
+            continue
         pairs = [r[0] for r in q("SELECT pair FROM subs WHERE chat_id=?", (chat_id,)) if r[0] in data]
         if not pairs:
             continue
+        rk = get_risk(chat_id)
         sig = [p for p in pairs if any(e["age"] == 0 for e in data[p]["events"])]
-        head = f"🌅 <b>Ежедневный разбор {today.date()}</b>"
-        parts = [head]
+        parts = [f"🌅 <b>Ежедневный разбор {today.date()}</b>"]
         for p in sig:
-            parts.append(pair_text({**data[p], "events": [e for e in data[p]["events"] if e["age"] == 0]}, with_triggers=False))
+            parts.append(pair_text({**data[p], "events": [e for e in data[p]["events"] if e["age"] == 0]},
+                                   with_triggers=False, rk=rk))
         quiet = [one_line(data[p]) for p in pairs if p not in sig]
         if quiet:
             parts.append("\n".join(quiet))
         send(chat_id, "\n\n———————\n\n".join(parts), MAIN_KB)
         if weekly:
             send(chat_id, "📅 <b>Итоги недели</b>\n\n" + stats_text())
+        set_meta(mark, "1")
     log("ежедневный разбор: готово")
+    return True
 
 
 def scheduler():
@@ -436,9 +649,16 @@ def scheduler():
             now = dt.datetime.now(dt.timezone.utc)
             key = now.strftime("%Y-%m-%d")
             if now.hour >= DAILY_HOUR_UTC and get_meta("last_daily") != key:
-                set_meta("last_daily", key)
-                if now.weekday() < 5:   # в выходные рынок закрыт
-                    run_daily()
+                if now.weekday() >= 5:          # в выходные рынок закрыт
+                    set_meta("last_daily", key)
+                else:
+                    tries = int(get_meta("tries:" + key) or 0)
+                    if tries < 30:              # при сбое данных пробуем каждую минуту до 30 раз
+                        set_meta("tries:" + key, str(tries + 1))
+                        if run_daily():
+                            set_meta("last_daily", key)
+                    else:
+                        set_meta("last_daily", key)
         except Exception:
             traceback.print_exc()
         time.sleep(60)
@@ -450,8 +670,8 @@ def btn(text, data):
 
 
 MAIN_KB = {"inline_keyboard": [
-    [btn("📈 Проверить пару", "menu")],
-    [btn("⭐ Мои пары и уведомления", "subs")],
+    [btn("📈 Проверить пару", "menu"), btn("📋 Обзор всех пар", "ov")],
+    [btn("⭐ Мои пары", "subs"), btn("🧮 Риск и лот", "risk")],
     [btn("📊 Статистика сигналов", "stats")],
     [btn("ℹ️ Как это работает", "help")],
 ]}
@@ -462,11 +682,12 @@ HELP = (
     "проверенным на 10 годах истории:\n"
     "1) цена пересекла EMA50 (основное)\n2) Stochastic вошёл в зону 20/80 (основное)\n"
     "3) разворот по RSI 30/70 (слабее)\n\n"
-    "«Проверить пару» — каждый раз новый расчёт: свежие сигналы, цены, за которыми "
-    "закрытие дня даст сигнал, уровни SL/TP и важные новости.\n"
-    f"«Мои пары» — выбери, по каким парам получать ежедневный разбор "
-    f"({DAILY_HOUR_UTC:02d}:00 UTC, в будни).\n"
-    "«Статистика» — как закончились прошлые сигналы бота.\n\n"
+    "📈 «Проверить пару» — свежий расчёт: сигналы, цены, за которыми закрытие дня даст сигнал, SL/TP, новости.\n"
+    "📋 «Обзор» — все пары одним экраном.\n"
+    f"⭐ «Мои пары» — по каким парам получать разбор ({DAILY_HOUR_UTC:02d}:00 UTC, по будням) "
+    "и включить 🔔 оповещения: бот напишет сразу, когда цена дойдёт до уровня «что ждать».\n"
+    "🧮 «Риск и лот» — задай депозит и процент риска, и бот будет писать объём лота под каждый SL.\n"
+    "📊 «Статистика» — как закончились прошлые сигналы бота.\n\n"
     "На истории преимущество небольшое (около +0.1–0.2R на сделку), "
     "поэтому сначала проверяй на демо-счёте. Не финансовая рекомендация."
 )
@@ -482,15 +703,17 @@ def pairs_kb():
 
 def subs_kb(chat_id):
     on = {r[0] for r in q("SELECT pair FROM subs WHERE chat_id=?", (chat_id,))}
-    daily = q("SELECT daily FROM users WHERE chat_id=?", (chat_id,))[0][0]
+    daily, alerts = q("SELECT daily, alerts FROM users WHERE chat_id=?", (chat_id,))[0]
     rows = [[btn(("✅ " if p in on else "☐ ") + p, "t:" + p.replace("/", ""))] for p in fa.PAIRS]
-    rows.append([btn("🔔 Ежедневный разбор: " + ("ВКЛ" if daily else "ВЫКЛ"), "d")])
+    rows.append([btn("🌅 Ежедневный разбор: " + ("ВКЛ" if daily else "ВЫКЛ"), "d")])
+    rows.append([btn("🔔 Оповещения о уровнях: " + ("ВКЛ" if alerts else "ВЫКЛ"), "a")])
     rows.append([btn("⬅️ Меню", "main")])
     return {"inline_keyboard": rows}
 
 
-SUBS_TEXT = ("⭐ Мои пары\n\nОтметь пары для ежедневного разбора. Проверить любую пару "
-             "можно в любой момент кнопкой «Проверить пару».")
+SUBS_TEXT = ("⭐ Мои пары\n\nОтметь пары для ежедневного разбора и оповещений. "
+             "🔔 Оповещения: бот напишет сразу, когда цена дойдёт до уровня «что ждать» "
+             "(проверка раз в несколько минут по будням).")
 
 
 def reply_kb():
@@ -508,7 +731,7 @@ def send_pair(chat_id, pair):
     r = send(chat_id, f"⏳ Считаю {pair}…")
     mid = ((r or {}).get("result") or {}).get("message_id")
     try:
-        txt = pair_text(analyze_pair(pair, force=True))
+        txt = pair_text(analyze_pair(pair, force=True), rk=get_risk(chat_id))
     except Exception as e:
         log(f"{pair}: {e}")
         txt = f"Не удалось получить данные по {pair}. Попробуй через минуту."
@@ -528,16 +751,49 @@ def handle_message(m):
     text = (m.get("text") or "").strip()
     cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
     key = text.upper().replace("/", "").replace(" ", "")
+    if get_meta(f"await_dep:{chat_id}") == "1" and not cmd and key not in KEY and text != "☰ Меню":
+        v = parse_num(text, 10, 10_000_000)
+        if v is None:
+            send(chat_id, "Напиши сумму депозита числом в долларах, например 1000. Отмена: /cancel.")
+        else:
+            q("UPDATE users SET deposit=? WHERE chat_id=?", (v, chat_id))
+            set_meta(f"await_dep:{chat_id}", "0")
+            send(chat_id, risk_text(chat_id), risk_kb())
+        return
     if cmd == "/start" or new:
         send(chat_id, "👋 Привет! Я слежу за 5 валютными парами (GBP/USD, EUR/USD, GBP/AUD, "
                       "EUR/NZD, EUR/CAD) и присылаю сигналы.\n\nТы уже подписан на ежедневный "
-                      "разбор по всем парам. Что делаем?", MAIN_KB)
+                      "разбор по всем парам. В «Моих парах» можно включить 🔔 оповещения, "
+                      "а в «Риск и лот» задать депозит, и я буду считать объём лота. Что делаем?", MAIN_KB)
     elif cmd == "/help":
         send(chat_id, HELP, MAIN_KB)
     elif cmd == "/stats":
         send(chat_id, stats_text(), MAIN_KB)
     elif cmd == "/pairs":
         send(chat_id, "Выбери пару:", pairs_kb())
+    elif cmd == "/overview":
+        r = send(chat_id, "⏳ Считаю все пары…")
+        mid = ((r or {}).get("result") or {}).get("message_id")
+        txt = overview_text()
+        edit(chat_id, mid, txt, MAIN_KB) if mid else send(chat_id, txt, MAIN_KB)
+    elif cmd == "/risk":
+        args = text.split()[1:]
+        dep = parse_num(args[0], 10, 10_000_000) if args else None
+        pct = parse_num(args[1], 0.1, 5) if len(args) > 1 else None
+        if args and dep is None:
+            send(chat_id, "Не понял сумму. Пример: /risk 1000 1 (депозит 1000 $, риск 1%).")
+            return
+        if dep is not None:
+            q("UPDATE users SET deposit=? WHERE chat_id=?", (dep, chat_id))
+        if pct is not None:
+            q("UPDATE users SET risk=? WHERE chat_id=?", (pct, chat_id))
+        send(chat_id, risk_text(chat_id), risk_kb())
+    elif cmd == "/status":
+        send(chat_id, status_text() if chat_id in ADMIN else "Команда только для администратора "
+             "(задай переменную ADMIN_IDS).")
+    elif cmd == "/cancel":
+        set_meta(f"await_dep:{chat_id}", "0")
+        send(chat_id, "Отменено.", MAIN_KB)
     elif key in KEY:
         send_pair(chat_id, KEY[key])
     else:
@@ -566,7 +822,7 @@ def handle_callback(cb):
         kb = {"inline_keyboard": [[btn("🔄 Обновить", data)], [btn("⬅️ К парам", "menu")]]}
         edit(chat_id, msg_id, f"⏳ Считаю {pair}…")
         try:
-            edit(chat_id, msg_id, pair_text(analyze_pair(pair, force=True)), kb)
+            edit(chat_id, msg_id, pair_text(analyze_pair(pair, force=True), rk=get_risk(chat_id)), kb)
         except Exception as e:
             log(f"{pair}: {e}")
             edit(chat_id, msg_id, f"Не удалось получить данные по {pair}. Попробуй через минуту.", kb)
@@ -582,6 +838,23 @@ def handle_callback(cb):
     elif data == "d":
         q("UPDATE users SET daily=1-daily WHERE chat_id=?", (chat_id,))
         edit(chat_id, msg_id, SUBS_TEXT, subs_kb(chat_id))
+    elif data == "a":
+        q("UPDATE users SET alerts=1-alerts WHERE chat_id=?", (chat_id,))
+        edit(chat_id, msg_id, SUBS_TEXT, subs_kb(chat_id))
+    elif data == "ov":
+        edit(chat_id, msg_id, "⏳ Считаю все пары…")
+        edit(chat_id, msg_id, overview_text(),
+             {"inline_keyboard": [[btn("🔄 Обновить", "ov")], [btn("⬅️ Меню", "main")]]})
+    elif data == "risk":
+        edit(chat_id, msg_id, risk_text(chat_id), risk_kb())
+    elif data.startswith("r:"):
+        pct = parse_num(data[2:], 0.1, 5)
+        if pct is not None:
+            q("UPDATE users SET risk=? WHERE chat_id=?", (pct, chat_id))
+        edit(chat_id, msg_id, risk_text(chat_id), risk_kb())
+    elif data == "dep":
+        set_meta(f"await_dep:{chat_id}", "1")
+        edit(chat_id, msg_id, "✏️ Напиши сумму депозита в долларах, например 1000.\nОтмена: /cancel.")
     elif data == "stats":
         edit(chat_id, msg_id, stats_text(), {"inline_keyboard": [[btn("⬅️ Меню", "main")]]})
     elif data == "help":
@@ -595,12 +868,33 @@ def handle_update(u):
         handle_callback(u["callback_query"])
 
 
+def setup_profile():
+    """Подсказки команд и описание бота в Telegram (то, что обычно настраивают через BotFather)."""
+    api("setMyCommands", commands=[
+        {"command": "start", "description": "Главное меню"},
+        {"command": "pairs", "description": "Проверить пару"},
+        {"command": "overview", "description": "Обзор всех пар"},
+        {"command": "stats", "description": "Статистика сигналов"},
+        {"command": "risk", "description": "Депозит и риск: /risk 1000 1"},
+        {"command": "help", "description": "Как это работает"},
+    ])
+    api("setMyShortDescription", short_description="Сигналы, уровни и SL/TP по 5 валютным парам. Оповещения и расчёт лота.")
+    api("setMyDescription", description=(
+        "Бот-аналитик по валютным парам GBP/USD, EUR/USD, GBP/AUD, EUR/NZD, EUR/CAD: "
+        "ежедневный разбор, уровни «что ждать», SL/TP, важные новости, оповещения при подходе цены к уровню, "
+        "расчёт объёма лота под ваш риск и журнал результатов. Не финансовая рекомендация."))
+
+
 def main():
     if not TOKEN:
         raise SystemExit("Не задан TELEGRAM_BOT_TOKEN")
     init_db()
     log(f"бот запущен, база: {DB_PATH}")
+    if not os.path.abspath(DB_PATH).startswith("/data"):
+        log("ВНИМАНИЕ: база не в /data. Если это не подключённый Volume, данные сотрутся при перезапуске.")
+    setup_profile()
     threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=alert_loop, daemon=True).start()
     offset = None
     while True:
         r = api("getUpdates", timeout=30, offset=offset, allowed_updates=["message", "callback_query"])
