@@ -417,3 +417,35 @@ def handle_callback(chat_id, msg_id, data):
                    trade_kb(t["id"], be=abs(t["sl"] - t["entry"]) >= PIP * 0.2))
         return True
     return False
+
+
+def diag_text():
+    now = pd.Timestamp.now(tz="UTC")
+    lines = ["🩺 <b>Диагностика интрадей-режима</b>",
+             f"Сейчас {now.strftime('%H:%M')} UTC (Ташкент = UTC+5, т.е. {(now + pd.Timedelta(hours=5)).strftime('%H:%M')}).",
+             f"Сигналы возможны только {idy.SESSION[0]:02d}:00-{idy.SESSION[1]:02d}:00 UTC "
+             f"({idy.SESSION[0] + 5:02d}:00-{idy.SESSION[1] + 5:02d}:00 по Ташкенту), в будни.", ""]
+    tot = {"events": 0, "session": 0, "trend_f": 0, "adx_f": 0, "weak": 0, "passed": 0}
+    for pair in fa.PAIRS:
+        try:
+            r = idy.explain(pair, now=now)
+        except Exception as e:
+            lines.append(f"{pair}: ошибка данных — {html.escape(str(e))[:60]}")
+            continue
+        for k in tot:
+            tot[k] += r[k]
+        tr = {1: "↑", -1: "↓", 0: "нет"}.get(int(r["trend"]) if r["trend"] == r["trend"] else 0, "?")
+        lines.append(f"<b>{pair}</b>: свеча {r['bar'].strftime('%H:%M')} UTC {'✅' if r['fresh'] else '⚠️ данные запаздывают'} "
+                     f"· тренд 4H {tr} · ADX {r['adx']:.0f}")
+    lines += ["", "<b>За последние 24 часа</b> (события правил по всем парам):",
+              f"всего событий: {tot['events']}",
+              f"• отсекла сессия: {tot['session']}",
+              f"• против тренда 4H: {tot['trend_f']}",
+              f"• слабый тренд (ADX): {tot['adx_f']}",
+              f"• мало подтверждений: {tot['weak']}",
+              f"• прошло фильтры: {tot['passed']}"]
+    sent = B.q("SELECT COUNT(*) FROM isignals WHERE created > ?", (time.time() - 86400,))[0][0]
+    lines.append(f"Сигналов отправлено за 24 ч: {sent}")
+    lines += ["", "Если события есть, а «прошло» = 0: бот работает исправно, фильтры просто строгие. "
+              "Если событий 0 на всех парах или стоят ⚠️: проблема с данными или ботом."]
+    return "\n".join(lines)

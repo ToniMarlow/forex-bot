@@ -234,3 +234,40 @@ def latest_signal(pair, df=None, now=None):
                 bar_ts=df.index[i].isoformat(), bar_end=bar_end.timestamp(),
                 expires=(bar_end + pd.Timedelta(hours=HOLD_BARS)).timestamp(),
                 entry=entry, sl=entry - d * sl_a * a, tp=entry + d * tp_a * a, atr=a, why=why), True
+
+
+def explain(pair, now=None, lookback=24):
+    """Диагностика: почему нет сигнала. Считает, какие фильтры отсекли события за последние lookback часов."""
+    now = now or pd.Timestamp.now(tz="UTC")
+    df = fetch_1h(fa.PAIRS[pair], "120d")
+    if df.index[-1] + pd.Timedelta(hours=1) > now:
+        df = df.iloc[:-1]
+    fresh = df.index[-1] == now.floor("h") - pd.Timedelta(hours=1)
+    ev, aux = build(df)
+    n = len(df)
+    dd = np.zeros(n, int)
+    conflict = np.zeros(n, bool)
+    for j in range(n - lookback, n):
+        dirs = {int(ev[r][j]) for r in RULES if ev[r][j] != 0}
+        if len(dirs) == 1:
+            dd[j] = next(iter(dirs))
+        conflict[j] = len(dirs) > 1
+    pts = grade_points(aux, ev, dd, df["Close"].values)
+    s_ok = hard_ok(df, aux, dd, {"session"})
+    res = dict(pair=pair, bar=df.index[-1], fresh=fresh, trend=aux["trend"][-1], adx=aux["adx"][-1],
+               events=0, session=0, trend_f=0, adx_f=0, weak=0, passed=0, conflict=int(conflict.sum()))
+    for j in range(n - lookback, n):
+        if dd[j] == 0:
+            continue
+        res["events"] += 1
+        if not s_ok[j]:
+            res["session"] += 1
+        elif aux["trend"][j] != dd[j]:
+            res["trend_f"] += 1
+        elif not aux["adx"][j] >= ADX_MIN:
+            res["adx_f"] += 1
+        elif pts[j] < MIN_PTS:
+            res["weak"] += 1
+        else:
+            res["passed"] += 1
+    return res

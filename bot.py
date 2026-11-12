@@ -773,6 +773,9 @@ def handle_message(m):
                       "а в «Риск и лот» задать депозит, и я буду считать объём лота. Что делаем?", MAIN_KB)
     elif cmd == "/help":
         send(chat_id, HELP, MAIN_KB)
+    elif cmd == "/diag":
+        send(chat_id, "Проверяю данные по всем парам, это займёт несколько секунд…")
+        send(chat_id, trades.diag_text(), MAIN_KB)
     elif cmd == "/trades":
         send(chat_id, trades.my_trades_text(chat_id)[0], MAIN_KB)
     elif cmd == "/stats":
