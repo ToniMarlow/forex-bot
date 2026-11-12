@@ -29,6 +29,7 @@ import html
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -38,6 +39,7 @@ import numpy as np
 import pandas as pd
 
 import forex_analyzer as fa
+import trades
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH") or ("/data/bot.db" if os.path.isdir("/data") else "bot.db")
@@ -599,7 +601,7 @@ def stats_text():
     lines.append(f"\nОткрытых сейчас: {len(opened)}")
     lines.append("R — результат в долях риска (1R = расстояние до стоп-лосса).")
     lines.append("Выборка маленькая: выводы делай после десятков сигналов.")
-    return "\n".join(lines)
+    return "\n".join(lines) + trades.intraday_stats_text()
 
 
 # ------------------------- ЕЖЕДНЕВНАЯ РАССЫЛКА -------------------------
@@ -671,8 +673,8 @@ def btn(text, data):
 
 MAIN_KB = {"inline_keyboard": [
     [btn("📈 Проверить пару", "menu"), btn("📋 Обзор всех пар", "ov")],
-    [btn("⭐ Мои пары", "subs"), btn("🧮 Риск и лот", "risk")],
-    [btn("📊 Статистика сигналов", "stats")],
+    [btn("📍 Мои сделки", "mytr"), btn("⭐ Мои пары", "subs")],
+    [btn("🧮 Риск и лот", "risk"), btn("📊 Статистика сигналов", "stats")],
     [btn("ℹ️ Как это работает", "help")],
 ]}
 
@@ -687,7 +689,10 @@ HELP = (
     f"⭐ «Мои пары» — по каким парам получать разбор ({DAILY_HOUR_UTC:02d}:00 UTC, по будням) "
     "и включить 🔔 оповещения: бот напишет сразу, когда цена дойдёт до уровня «что ждать».\n"
     "🧮 «Риск и лот» — задай депозит и процент риска, и бот будет писать объём лота под каждый SL.\n"
-    "📊 «Статистика» — как закончились прошлые сигналы бота.\n\n"
+    "📊 «Статистика» — как закончились прошлые сигналы бота.\n"
+    "⚡ Интрадей-сигналы: раз в час бот ищет решительный вход (BUY или SELL) на 1H-свечах, сделка живёт до 4 часов. "
+    "Нажми «Я вошёл», и бот следит за сделкой сам: половина пути к TP, близость стопа, новости, TP/SL, конец времени. "
+    "📍 «Мои сделки» показывает всё в реальном времени.\n\n"
     "На истории преимущество небольшое (около +0.1–0.2R на сделку), "
     "поэтому сначала проверяй на демо-счёте. Не финансовая рекомендация."
 )
@@ -703,10 +708,11 @@ def pairs_kb():
 
 def subs_kb(chat_id):
     on = {r[0] for r in q("SELECT pair FROM subs WHERE chat_id=?", (chat_id,))}
-    daily, alerts = q("SELECT daily, alerts FROM users WHERE chat_id=?", (chat_id,))[0]
+    daily, alerts, intr = q("SELECT daily, alerts, intraday FROM users WHERE chat_id=?", (chat_id,))[0]
     rows = [[btn(("✅ " if p in on else "☐ ") + p, "t:" + p.replace("/", ""))] for p in fa.PAIRS]
     rows.append([btn("🌅 Ежедневный разбор: " + ("ВКЛ" if daily else "ВЫКЛ"), "d")])
     rows.append([btn("🔔 Оповещения о уровнях: " + ("ВКЛ" if alerts else "ВЫКЛ"), "a")])
+    rows.append([btn("⚡ Интрадей-сигналы (до 4 ч): " + ("ВКЛ" if intr else "ВЫКЛ"), "i")])
     rows.append([btn("⬅️ Меню", "main")])
     return {"inline_keyboard": rows}
 
@@ -767,6 +773,8 @@ def handle_message(m):
                       "а в «Риск и лот» задать депозит, и я буду считать объём лота. Что делаем?", MAIN_KB)
     elif cmd == "/help":
         send(chat_id, HELP, MAIN_KB)
+    elif cmd == "/trades":
+        send(chat_id, trades.my_trades_text(chat_id)[0], MAIN_KB)
     elif cmd == "/stats":
         send(chat_id, stats_text(), MAIN_KB)
     elif cmd == "/pairs":
@@ -813,6 +821,8 @@ def handle_callback(cb):
     if ALLOWED and chat_id not in ALLOWED:
         return
     ensure_user(chat_id, (cb.get("from") or {}).get("first_name", ""))
+    if trades.handle_callback(chat_id, msg_id, data):
+        return
     if data == "main":
         edit(chat_id, msg_id, "Выбери действие:", MAIN_KB)
     elif data == "menu":
@@ -874,6 +884,7 @@ def setup_profile():
         {"command": "start", "description": "Главное меню"},
         {"command": "pairs", "description": "Проверить пару"},
         {"command": "overview", "description": "Обзор всех пар"},
+        {"command": "trades", "description": "Мои сделки (слежение)"},
         {"command": "stats", "description": "Статистика сигналов"},
         {"command": "risk", "description": "Депозит и риск: /risk 1000 1"},
         {"command": "help", "description": "Как это работает"},
@@ -889,12 +900,17 @@ def main():
     if not TOKEN:
         raise SystemExit("Не задан TELEGRAM_BOT_TOKEN")
     init_db()
+    trades.bind(sys.modules[__name__])
+    trades.init_tables()
     log(f"бот запущен, база: {DB_PATH}")
     if not os.path.abspath(DB_PATH).startswith("/data"):
         log("ВНИМАНИЕ: база не в /data. Если это не подключённый Volume, данные сотрутся при перезапуске.")
     setup_profile()
     threading.Thread(target=scheduler, daemon=True).start()
     threading.Thread(target=alert_loop, daemon=True).start()
+    if os.environ.get("INTRADAY", "1") == "1":
+        threading.Thread(target=trades.scan_loop, daemon=True).start()
+    threading.Thread(target=trades.track_loop, daemon=True).start()
     offset = None
     while True:
         r = api("getUpdates", timeout=30, offset=offset, allowed_updates=["message", "callback_query"])
